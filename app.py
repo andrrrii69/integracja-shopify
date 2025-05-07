@@ -40,6 +40,13 @@ def orders_create():
     order = request.get_json()
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
 
+    # Determine business activity kind
+    nip = billing.get('nip') or billing.get('company_nip')
+    if nip:
+        business_kind = 'Inna forma działalności'
+    else:
+        business_kind = 'Osoba prywatna'
+
     # Client fields
     client_fields = {
         'client_first_name': billing.get('first_name', ''),
@@ -49,11 +56,10 @@ def orders_create():
         'client_flat_number': billing.get('address2', ''),
         'client_city': billing.get('city', ''),
         'client_post_code': billing.get('zip', ''),
+        'client_business_activity_kind': business_kind
     }
-    # Only include NIP if provided
-    clean_nip = billing.get('nip') or billing.get('company_nip')
-    if clean_nip:
-        client_fields['client_tax_code'] = clean_nip
+    if nip:
+        client_fields['client_tax_code'] = nip
 
     # Build 'services' array
     services = []
@@ -82,7 +88,7 @@ def orders_create():
         'invoice': {
             'kind': 'vat',
             'series': os.getenv('INFAKT_SERIES', 'A'),
-            'status': 'draft',
+            'status': 'paid',  # mark as paid
             'sell_date': sell_date,
             'issue_date': issue_date,
             'payment_due_date': due_date,
@@ -97,7 +103,7 @@ def orders_create():
     if not resp.ok:
         app.logger.error(f"[inFakt VAT ERROR] status={resp.status_code}, body={resp.text}")
         resp.raise_for_status()
-    app.logger.info("VAT invoice created: %s", resp.json())
+    app.logger.info("VAT invoice created and paid: %s", resp.json())
     return '', 200
 
 if __name__ == '__main__':
