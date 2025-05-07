@@ -35,12 +35,15 @@ def get_or_create_client(billing, email):
     clients = resp.json().get('clients', [])
     if clients:
         return clients[0]['id']
-    # Create new client as private person
+    # Extract name/company
+    name = f"{billing.get('first_name','')} {billing.get('last_name','')}".strip()
+    company = billing.get('company') or name
     client_payload = {
         'client': {
             'client_kind': 'private_person',
             'vat_payer': False,
-            'name': f"{billing.get('first_name','')} {billing.get('last_name','')}".strip(),
+            'name': name,
+            'company_name': company,
             'email': email,
             'street': billing.get('address1'),
             'city': billing.get('city'),

@@ -1,5 +1,5 @@
 # Shopify - inFakt Integration
 
-This update fixes client creation by using `client_kind` instead of `kind`.
+Added `company_name` in client creation to satisfy API requirements for `company_name`.
 
-## Setup unchanged.
+## Usage unchanged.
