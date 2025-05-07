@@ -33,15 +33,12 @@ def healthcheck():
 
 @app.route('/webhook/orders/create', methods=['POST'])
 def orders_create():
-    # Verify Shopify webhook signature
     raw_body = request.get_data()
     shopify_hmac = request.headers.get('X-Shopify-Hmac-Sha256', '')
     if not verify_shopify_webhook(raw_body, shopify_hmac):
         abort(401, 'Invalid HMAC signature')
 
     order = request.get_json()
-
-    # Map buyer data directly into the invoice payload
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
     buyer = {
         'name': f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip(),
@@ -51,8 +48,6 @@ def orders_create():
         'country_code': billing.get('country_code'),
         'email': order.get('email'),
     }
-
-    # Map line items to invoice positions
     positions = [{
         'name': line['title'],
         'quantity': line['quantity'],
@@ -60,13 +55,11 @@ def orders_create():
         'vat_rate': 23,
     } for line in order.get('line_items', [])]
 
-    # Dates
     created_at = datetime.strptime(order['created_at'], '%Y-%m-%dT%H:%M:%S%z')
     sell_date = created_at.date().isoformat()
     issue_date = sell_date
     payment_due = (created_at + timedelta(days=7)).date().isoformat()
 
-    # Payload with buyer structure
     payload = {
         'invoice': {
             'status': 'draft',
@@ -79,7 +72,6 @@ def orders_create():
         }
     }
 
-    # Send async create invoice request
     resp = requests.post(CREATE_ENDPOINT, json=payload, headers=HEADERS)
     if not resp.ok:
         app.logger.error(f"[inFakt CREATE ERROR] status={resp.status_code}, body={resp.text}")
@@ -87,7 +79,6 @@ def orders_create():
     data = resp.json()
     ref = data.get('invoice_task_reference_number')
 
-    # Poll status
     for _ in range(12):
         st = requests.get(STATUS_ENDPOINT_TMPL.format(ref=ref), headers=HEADERS)
         st.raise_for_status()
