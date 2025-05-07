@@ -2,7 +2,6 @@ import os
 import hmac
 import hashlib
 import base64
-import time
 from datetime import datetime, timedelta
 
 from flask import Flask, request, abort
@@ -40,13 +39,6 @@ def orders_create():
     order = request.get_json()
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
 
-    # Determine business activity kind
-    nip = billing.get('nip') or billing.get('company_nip')
-    if nip:
-        business_kind = 'Inna forma działalności'
-    else:
-        business_kind = 'Osoba prywatna'
-
     # Client fields
     client_fields = {
         'client_first_name': billing.get('first_name', ''),
@@ -56,8 +48,9 @@ def orders_create():
         'client_flat_number': billing.get('address2', ''),
         'client_city': billing.get('city', ''),
         'client_post_code': billing.get('zip', ''),
-        'client_business_activity_kind': business_kind
     }
+    # Only include NIP if provided
+    nip = billing.get('nip') or billing.get('company_nip')
     if nip:
         client_fields['client_tax_code'] = nip
 
@@ -88,7 +81,7 @@ def orders_create():
         'invoice': {
             'kind': 'vat',
             'series': os.getenv('INFAKT_SERIES', 'A'),
-            'status': 'paid',  # mark as paid
+            'status': 'paid',
             'sell_date': sell_date,
             'issue_date': issue_date,
             'payment_due_date': due_date,
