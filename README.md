@@ -15,7 +15,11 @@ This project listens to Shopify `orders/create` webhooks and automatically creat
    - `INFAKT_HOST` – (optional) inFakt API host, default `api.infakt.pl`.
 4. Run the app:
    ```bash
+   # For development
    flask run --host=0.0.0.0 --port=5000
+
+   # For production
+   gunicorn app:app --bind 0.0.0.0:$PORT
    ```
 5. Configure Shopify webhook:
    - URL: `https://your-domain.com/webhook/orders/create`
@@ -27,4 +31,4 @@ This project listens to Shopify `orders/create` webhooks and automatically creat
 
 - `SHOPIFY_WEBHOOK_SECRET`
 - `INFAKT_API_KEY`
-- `INFAKT_HOST` (optional, defaults to `api.infakt.pl`)
+- `INFAKT_HOST` (optional)

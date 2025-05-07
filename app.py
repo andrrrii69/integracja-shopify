@@ -11,7 +11,7 @@ import requests
 app = Flask(__name__)
 
 # CONFIG
-SHOPIFY_WEBHOOK_SECRET = os.getenv('SHOPIFY_WEBHOOK_SECRET').encode('utf-8')
+SHOPIFY_WEBHOOK_SECRET = os.getenv('SHOPIFY_WEBHOOK_SECRET', '').encode('utf-8')
 INFAKT_API_KEY = os.getenv('INFAKT_API_KEY')
 HOST = os.getenv('INFAKT_HOST', 'api.infakt.pl')
 CREATE_ENDPOINT = f'https://{HOST}/api/v3/async/invoices.json'
@@ -26,6 +26,10 @@ HEADERS = {
 def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
     computed = base64.b64encode(hmac.new(SHOPIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest())
     return hmac.compare_digest(computed.decode('utf-8'), hmac_header)
+
+@app.route('/', methods=['GET'])
+def healthcheck():
+    return 'OK', 200
 
 @app.route('/webhook/orders/create', methods=['POST'])
 def orders_create():
@@ -67,10 +71,14 @@ def orders_create():
             'positions': positions
         }
     }
+
     resp = requests.post(CREATE_ENDPOINT, json=payload, headers=HEADERS)
-    resp.raise_for_status()
+    if not resp.ok:
+        app.logger.error(f"[inFakt CREATE ERROR] status={resp.status_code}, body={resp.text}")
+        resp.raise_for_status()
     data = resp.json()
     ref = data.get('invoice_task_reference_number')
+
     for _ in range(12):
         st = requests.get(STATUS_ENDPOINT_TMPL.format(ref=ref), headers=HEADERS)
         st.raise_for_status()
@@ -80,7 +88,7 @@ def orders_create():
             app.logger.info(f"Invoice created successfully: {info}")
             break
         elif code == 422:
-            app.logger.error(f"Failed to create invoice: {info.get('processing_description')}")
+            app.logger.error(f"[inFakt PROCESSING ERROR] {info}")
             break
         time.sleep(5)
     return '', 200
