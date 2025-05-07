@@ -39,6 +39,13 @@ def orders_create():
     order = request.get_json()
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
 
+    # Determine business activity kind code
+    nip = billing.get('nip') or billing.get('company_nip')
+    if nip:
+        activity_kind = 'other_business'
+    else:
+        activity_kind = 'private_person'
+
     # Client fields
     client_fields = {
         'client_first_name': billing.get('first_name', ''),
@@ -48,9 +55,8 @@ def orders_create():
         'client_flat_number': billing.get('address2', ''),
         'client_city': billing.get('city', ''),
         'client_post_code': billing.get('zip', ''),
+        'client_business_activity_kind': activity_kind,
     }
-    # Only include NIP if provided
-    nip = billing.get('nip') or billing.get('company_nip')
     if nip:
         client_fields['client_tax_code'] = nip
 
