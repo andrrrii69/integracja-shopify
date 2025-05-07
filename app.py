@@ -39,14 +39,12 @@ def orders_create():
     order = request.get_json()
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
 
-    # Determine business activity kind code
     nip = billing.get('nip') or billing.get('company_nip')
     if nip:
         activity_kind = 'other_business'
     else:
         activity_kind = 'private_person'
 
-    # Client fields
     client_fields = {
         'client_first_name': billing.get('first_name', ''),
         'client_last_name': billing.get('last_name', ''),
@@ -60,7 +58,6 @@ def orders_create():
     if nip:
         client_fields['client_tax_code'] = nip
 
-    # Build 'services' array
     services = []
     for item in order.get('line_items', []):
         qty = item['quantity']
@@ -90,6 +87,7 @@ def orders_create():
             'status': 'paid',
             'sell_date': sell_date,
             'issue_date': issue_date,
+            'paid_date': issue_date,  # Data opłacenia = data złożenia zamówienia
             'payment_due_date': due_date,
             'payment_method': 'transfer',
             'currency': 'PLN',
