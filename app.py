@@ -16,6 +16,7 @@ INFAKT_API_KEY = os.getenv('INFAKT_API_KEY')
 HOST = os.getenv('INFAKT_HOST', 'api.infakt.pl')
 CREATE_ENDPOINT = f'https://{HOST}/api/v3/async/invoices.json'
 STATUS_ENDPOINT_TMPL = f'https://{HOST}/api/v3/async/invoices/status/{{ref}}.json'
+CLIENTS_ENDPOINT = f'https://{HOST}/api/v3/clients.json'
 
 HEADERS = {
     'X-inFakt-ApiKey': INFAKT_API_KEY,
@@ -26,6 +27,30 @@ HEADERS = {
 def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
     computed = base64.b64encode(hmac.new(SHOPIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest())
     return hmac.compare_digest(computed.decode('utf-8'), hmac_header)
+
+def get_or_create_client(billing, email):
+    # Try to find existing client by email
+    params = {'search': email}
+    resp = requests.get(CLIENTS_ENDPOINT, headers=HEADERS, params=params)
+    resp.raise_for_status()
+    clients = resp.json().get('clients', [])
+    if clients:
+        return clients[0]['id']
+    # Create new client
+    client_payload = {
+        'client': {
+            'name': f"{billing.get('first_name','')} {billing.get('last_name','')}".strip(),
+            'email': email,
+            'street': billing.get('address1'),
+            'city': billing.get('city'),
+            'zip_code': billing.get('zip'),
+            'country_code': billing.get('country_code'),
+        }
+    }
+    rc = requests.post(CLIENTS_ENDPOINT, json=client_payload, headers=HEADERS)
+    rc.raise_for_status()
+    new_id = rc.json().get('client', {}).get('id')
+    return new_id
 
 @app.route('/', methods=['GET'])
 def healthcheck():
@@ -40,14 +65,9 @@ def orders_create():
 
     order = request.get_json()
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
-    buyer = {
-        'name': f"{billing.get('first_name','')} {billing.get('last_name','')}".strip(),
-        'street': billing.get('address1'),
-        'city': billing.get('city'),
-        'zip_code': billing.get('zip'),
-        'country_code': billing.get('country_code'),
-        'email': order.get('email'),
-    }
+    email = order.get('email')
+    client_id = get_or_create_client(billing, email)
+
     positions = []
     for line in order.get('line_items', []):
         positions.append({
@@ -56,18 +76,20 @@ def orders_create():
             'unit_gross_price': float(line['price']),
             'vat_rate': 23
         })
+
     created_at = datetime.strptime(order['created_at'], '%Y-%m-%dT%H:%M:%S%z')
     sell_date = created_at.date().isoformat()
     issue_date = sell_date
     payment_due = (created_at + timedelta(days=7)).date().isoformat()
+
     payload = {
         'invoice': {
+            'client_id': client_id,
             'status': 'draft',
             'sell_date': sell_date,
             'issue_date': issue_date,
             'payment_due_date': payment_due,
             'payment_method': 'transfer',
-            'buyer': buyer,
             'positions': positions
         }
     }

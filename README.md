@@ -2,6 +2,8 @@
 
 This project listens to Shopify `orders/create` webhooks and automatically creates invoices in inFakt via their async API.
 
+It now also handles clients: it will search for an existing client by email or create a new one before issuing the invoice.
+
 ## Setup
 
 1. Clone the repo and navigate to the directory.
@@ -10,7 +12,7 @@ This project listens to Shopify `orders/create` webhooks and automatically creat
    pip install -r requirements.txt
    ```
 3. Define environment variables (see `.env.example`):
-   - `SHOPIFY_WEBHOOK_SECRET` – Shopify webhook secret (used to verify incoming webhooks).
+   - `SHOPIFY_WEBHOOK_SECRET` – Shopify webhook secret.
    - `INFAKT_API_KEY` – API key from inFakt.
    - `INFAKT_HOST` – (optional) inFakt API host, default `api.infakt.pl`.
 4. Run the app:
@@ -25,7 +27,7 @@ This project listens to Shopify `orders/create` webhooks and automatically creat
    - URL: `https://your-domain.com/webhook/orders/create`
    - Event: **Order creation**
    - Format: `application/json`
-   - Shared secret: same as `SHOPIFY_WEBHOOK_SECRET`
+   - Shared secret: `SHOPIFY_WEBHOOK_SECRET`
 
 ## Environment Variables
 
