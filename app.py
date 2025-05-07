@@ -41,7 +41,7 @@ def orders_create():
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
 
     # Client fields
-    buyer = {
+    client_fields = {
         'client_first_name': billing.get('first_name', ''),
         'client_last_name': billing.get('last_name', ''),
         'client_company_name': billing.get('company', ''),
@@ -52,13 +52,25 @@ def orders_create():
         'client_tax_code': billing.get('company', ''),  # NIP if any
     }
 
-    # Map items to 'services'
-    services = [{
-        'name': item['title'],
-        'quantity': item['quantity'],
-        'unit_gross_price': float(item['price']),
-        'vat_rate': 23,
-    } for item in order.get('line_items', [])]
+    # Build 'services' array
+    services = []
+    for item in order.get('line_items', []):
+        qty = item['quantity']
+        # Shopify price is gross in string, convert to float then grosze
+        gross_per_unit = int(round(float(item['price']) * 100))
+        # compute net unit price (rounded)
+        net_unit = int(round(gross_per_unit / 1.23))
+        tax_unit = gross_per_unit - net_unit
+        services.append({
+            'name': item['title'],
+            'tax_symbol': '23',            # VAT rate symbol
+            'quantity': qty,
+            'unit_net_price': net_unit,     # netto złoty*100
+            'unit_cost': net_unit,
+            'gross_price': gross_per_unit * qty,
+            'tax_price': tax_unit * qty,
+            'flat_rate_tax_symbol': '3',
+        })
 
     created = datetime.strptime(order['created_at'], '%Y-%m-%dT%H:%M:%S%z')
     sell_date = created.date().isoformat()
@@ -75,7 +87,7 @@ def orders_create():
             'payment_due_date': due_date,
             'payment_method': 'transfer',
             'currency': 'PLN',
-            **buyer,
+            **client_fields,
             'services': services
         }
     }
