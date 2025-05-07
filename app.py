@@ -49,23 +49,24 @@ def orders_create():
         'client_flat_number': billing.get('address2', ''),
         'client_city': billing.get('city', ''),
         'client_post_code': billing.get('zip', ''),
-        'client_tax_code': billing.get('company', ''),  # NIP if any
     }
+    # Only include NIP if provided
+    clean_nip = billing.get('nip') or billing.get('company_nip')
+    if clean_nip:
+        client_fields['client_tax_code'] = clean_nip
 
     # Build 'services' array
     services = []
     for item in order.get('line_items', []):
         qty = item['quantity']
-        # Shopify price is gross in string, convert to float then grosze
         gross_per_unit = int(round(float(item['price']) * 100))
-        # compute net unit price (rounded)
         net_unit = int(round(gross_per_unit / 1.23))
         tax_unit = gross_per_unit - net_unit
         services.append({
             'name': item['title'],
-            'tax_symbol': '23',            # VAT rate symbol
+            'tax_symbol': '23',
             'quantity': qty,
-            'unit_net_price': net_unit,     # netto złoty*100
+            'unit_net_price': net_unit,
             'unit_cost': net_unit,
             'gross_price': gross_per_unit * qty,
             'tax_price': tax_unit * qty,
