@@ -39,12 +39,14 @@ def orders_create():
     order = request.get_json()
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
 
+    # Determine business activity kind code
     nip = billing.get('nip') or billing.get('company_nip')
     if nip:
         activity_kind = 'other_business'
     else:
         activity_kind = 'private_person'
 
+    # Client fields
     client_fields = {
         'client_first_name': billing.get('first_name', ''),
         'client_last_name': billing.get('last_name', ''),
@@ -58,6 +60,7 @@ def orders_create():
     if nip:
         client_fields['client_tax_code'] = nip
 
+    # Build 'services' array
     services = []
     for item in order.get('line_items', []):
         qty = item['quantity']
@@ -87,7 +90,6 @@ def orders_create():
             'status': 'paid',
             'sell_date': sell_date,
             'issue_date': issue_date,
-            'paid_date': issue_date,
             'payment_due_date': due_date,
             'payment_method': 'transfer',
             'currency': 'PLN',
@@ -96,34 +98,11 @@ def orders_create():
         }
     }
 
-    # 1) Create the invoice
     resp = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
     if not resp.ok:
         app.logger.error(f"[inFakt VAT ERROR] status={resp.status_code}, body={resp.text}")
         resp.raise_for_status()
-    invoice = resp.json()['invoice']
-    app.logger.info("VAT invoice created: %s", invoice)
-
-    # 2) Register the payment to mark invoice as paid
-    uuid = invoice['uuid']
-    total_grosze = invoice['gross_price']
-    payment_payload = {
-        "payment": {
-            "date": order['created_at'][:10],
-            "value": total_grosze,
-            "payment_method": "transfer"
-        }
-    }
-    pay_resp = requests.post(
-        f"https://{HOST}/api/v3/invoices/{uuid}/payments.json",
-        json=payment_payload,
-        headers=HEADERS
-    )
-    if not pay_resp.ok:
-        app.logger.error(f"[inFakt PAYMENT ERROR] status={pay_resp.status_code}, body={pay_resp.text}")
-        pay_resp.raise_for_status()
-    app.logger.info("Payment recorded, invoice marked as paid: %s", pay_resp.json())
-
+    app.logger.info("VAT invoice created and paid: %s", resp.json())
     return '', 200
 
 if __name__ == '__main__':
