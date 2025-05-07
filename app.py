@@ -40,21 +40,24 @@ def orders_create():
     order = request.get_json()
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
 
-    # Prepare client fields when no client_id
-    client_first_name = billing.get('first_name', '')
-    client_last_name  = billing.get('last_name', '')
-    client_company_name = billing.get('company', '')
-    client_street = billing.get('address1', '')
-    client_flat_number = billing.get('address2', '')
-    client_city = billing.get('city', '')
-    client_post_code = billing.get('zip', '')
-    client_tax_code = billing.get('company', '')  # or specific NIP field
+    # Client fields
+    buyer = {
+        'client_first_name': billing.get('first_name', ''),
+        'client_last_name': billing.get('last_name', ''),
+        'client_company_name': billing.get('company', ''),
+        'client_street': billing.get('address1', ''),
+        'client_flat_number': billing.get('address2', ''),
+        'client_city': billing.get('city', ''),
+        'client_post_code': billing.get('zip', ''),
+        'client_tax_code': billing.get('company', ''),  # NIP if any
+    }
 
-    positions = [{
+    # Map items to 'services'
+    services = [{
         'name': item['title'],
         'quantity': item['quantity'],
         'unit_gross_price': float(item['price']),
-        'vat_rate': 23
+        'vat_rate': 23,
     } for item in order.get('line_items', [])]
 
     created = datetime.strptime(order['created_at'], '%Y-%m-%dT%H:%M:%S%z')
@@ -72,16 +75,8 @@ def orders_create():
             'payment_due_date': due_date,
             'payment_method': 'transfer',
             'currency': 'PLN',
-            # client_id omitted; use explicit client_ fields
-            'client_first_name': client_first_name,
-            'client_last_name': client_last_name,
-            **({'client_company_name': client_company_name} if client_company_name else {}),
-            'client_street': client_street,
-            'client_flat_number': client_flat_number,
-            'client_city': client_city,
-            'client_post_code': client_post_code,
-            **({'client_tax_code': client_tax_code} if client_tax_code else {}),
-            'positions': positions
+            **buyer,
+            'services': services
         }
     }
 
