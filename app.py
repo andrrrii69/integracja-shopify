@@ -38,10 +38,10 @@ def get_or_create_client(billing, email):
     # Create new client as private person
     client_payload = {
         'client': {
+            'client_kind': 'private_person',
+            'vat_payer': False,
             'name': f"{billing.get('first_name','')} {billing.get('last_name','')}".strip(),
             'email': email,
-            'kind': 'private_person',
-            'vat_payer': False,
             'street': billing.get('address1'),
             'city': billing.get('city'),
             'zip_code': billing.get('zip'),
@@ -83,14 +83,14 @@ def orders_create():
     payment_due = (created_at + timedelta(days=7)).date().isoformat()
 
     payload = {'invoice': {
-            'client_id': client_id,
-            'status': 'draft',
-            'sell_date': sell_date,
-            'issue_date': issue_date,
-            'payment_due_date': payment_due,
-            'payment_method': 'transfer',
-            'positions': positions
-        }
+        'client_id': client_id,
+        'status': 'draft',
+        'sell_date': sell_date,
+        'issue_date': issue_date,
+        'payment_due_date': payment_due,
+        'payment_method': 'transfer',
+        'positions': positions
+    }
     }
 
     resp = requests.post(CREATE_ENDPOINT, json=payload, headers=HEADERS)
