@@ -30,17 +30,18 @@ def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
 
 def get_or_create_client(billing, email):
     # Try to find existing client by email
-    params = {'search': email}
-    resp = requests.get(CLIENTS_ENDPOINT, headers=HEADERS, params=params)
+    resp = requests.get(CLIENTS_ENDPOINT, headers=HEADERS, params={'search': email})
     resp.raise_for_status()
     clients = resp.json().get('clients', [])
     if clients:
         return clients[0]['id']
-    # Create new client
+    # Create new client as private person
     client_payload = {
         'client': {
             'name': f"{billing.get('first_name','')} {billing.get('last_name','')}".strip(),
             'email': email,
+            'kind': 'private_person',
+            'vat_payer': False,
             'street': billing.get('address1'),
             'city': billing.get('city'),
             'zip_code': billing.get('zip'),
@@ -48,9 +49,10 @@ def get_or_create_client(billing, email):
         }
     }
     rc = requests.post(CLIENTS_ENDPOINT, json=client_payload, headers=HEADERS)
-    rc.raise_for_status()
-    new_id = rc.json().get('client', {}).get('id')
-    return new_id
+    if not rc.ok:
+        app.logger.error(f"[inFakt CLIENT CREATE ERROR] status={rc.status_code}, body={rc.text}")
+        rc.raise_for_status()
+    return rc.json().get('client', {}).get('id')
 
 @app.route('/', methods=['GET'])
 def healthcheck():
@@ -68,22 +70,19 @@ def orders_create():
     email = order.get('email')
     client_id = get_or_create_client(billing, email)
 
-    positions = []
-    for line in order.get('line_items', []):
-        positions.append({
-            'name': line['title'],
-            'quantity': line['quantity'],
-            'unit_gross_price': float(line['price']),
-            'vat_rate': 23
-        })
+    positions = [{
+        'name': line['title'],
+        'quantity': line['quantity'],
+        'unit_gross_price': float(line['price']),
+        'vat_rate': 23
+    } for line in order.get('line_items', [])]
 
     created_at = datetime.strptime(order['created_at'], '%Y-%m-%dT%H:%M:%S%z')
     sell_date = created_at.date().isoformat()
     issue_date = sell_date
     payment_due = (created_at + timedelta(days=7)).date().isoformat()
 
-    payload = {
-        'invoice': {
+    payload = {'invoice': {
             'client_id': client_id,
             'status': 'draft',
             'sell_date': sell_date,
