@@ -87,7 +87,7 @@ def orders_create():
             'status': 'paid',
             'sell_date': sell_date,
             'issue_date': issue_date,
-            'paid_date': issue_date,  # Data opłacenia = data złożenia zamówienia
+            'paid_date': issue_date,
             'payment_due_date': due_date,
             'payment_method': 'transfer',
             'currency': 'PLN',
@@ -96,11 +96,34 @@ def orders_create():
         }
     }
 
+    # 1) Create the invoice
     resp = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
     if not resp.ok:
         app.logger.error(f"[inFakt VAT ERROR] status={resp.status_code}, body={resp.text}")
         resp.raise_for_status()
-    app.logger.info("VAT invoice created and paid: %s", resp.json())
+    invoice = resp.json()['invoice']
+    app.logger.info("VAT invoice created: %s", invoice)
+
+    # 2) Register the payment to mark invoice as paid
+    uuid = invoice['uuid']
+    total_grosze = invoice['gross_price']
+    payment_payload = {
+        "payment": {
+            "date": order['created_at'][:10],
+            "value": total_grosze,
+            "payment_method": "transfer"
+        }
+    }
+    pay_resp = requests.post(
+        f"https://{HOST}/api/v3/invoices/{uuid}/payments.json",
+        json=payment_payload,
+        headers=HEADERS
+    )
+    if not pay_resp.ok:
+        app.logger.error(f"[inFakt PAYMENT ERROR] status={pay_resp.status_code}, body={pay_resp.text}")
+        pay_resp.raise_for_status()
+    app.logger.info("Payment recorded, invoice marked as paid: %s", pay_resp.json())
+
     return '', 200
 
 if __name__ == '__main__':
