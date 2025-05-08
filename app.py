@@ -1,3 +1,4 @@
+
 import os
 import hmac
 import hashlib
@@ -39,14 +40,9 @@ def orders_create():
     order = request.get_json()
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
 
-    # Determine business activity kind code
     nip = billing.get('nip') or billing.get('company_nip')
-    if nip:
-        activity_kind = 'other_business'
-    else:
-        activity_kind = 'private_person'
+    activity_kind = 'other_business' if nip else 'private_person'
 
-    # Client fields
     client_fields = {
         'client_first_name': billing.get('first_name', ''),
         'client_last_name': billing.get('last_name', ''),
@@ -60,7 +56,6 @@ def orders_create():
     if nip:
         client_fields['client_tax_code'] = nip
 
-    # Build 'services' array
     services = []
     for item in order.get('line_items', []):
         qty = item['quantity']
@@ -87,7 +82,7 @@ def orders_create():
         'invoice': {
             'kind': 'vat',
             'series': os.getenv('INFAKT_SERIES', 'A'),
-            'status': 'paid',
+            'status': 'issued',
             'sell_date': sell_date,
             'issue_date': issue_date,
             'payment_due_date': due_date,
@@ -99,10 +94,28 @@ def orders_create():
     }
 
     resp = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
-    if not resp.ok:
-        app.logger.error(f"[inFakt VAT ERROR] status={resp.status_code}, body={resp.text}")
-        resp.raise_for_status()
-    app.logger.info("VAT invoice created and paid: %s", resp.json())
+if not resp.ok:
+    app.logger.error(f"[inFakt VAT ERROR] status={resp.status_code}, body={resp.text}")
+    resp.raise_for_status()
+
+resp_json = resp.json()
+app.logger.info(f"Pełna odpowiedź API: {resp_json}")  # tutaj zalogujesz całą odpowiedź
+
+invoice_uuid = resp_json.get('id')
+if not invoice_uuid:
+    app.logger.error("Brak invoice_uuid w odpowiedzi!")
+    abort(500, "Brak invoice_uuid w odpowiedzi API")
+
+
+    mark_paid_url = f'https://{HOST}/api/v3/async/invoices/{invoice_uuid}/paid.json'
+    paid_resp = requests.post(mark_paid_url, headers=HEADERS)
+
+    if paid_resp.status_code != 201:
+        app.logger.error(f"[inFakt PAID ERROR] status={paid_resp.status_code}, body={paid_resp.text}")
+        paid_resp.raise_for_status()
+    else:
+        app.logger.info("Invoice successfully marked as paid.")
+
     return '', 200
 
 if __name__ == '__main__':
