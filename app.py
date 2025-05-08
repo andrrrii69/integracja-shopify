@@ -1,4 +1,3 @@
-
 import os
 import hmac
 import hashlib
@@ -10,7 +9,6 @@ import requests
 
 app = Flask(__name__)
 
-# CONFIG
 SHOPIFY_WEBHOOK_SECRET = os.getenv('SHOPIFY_WEBHOOK_SECRET', '').encode('utf-8')
 INFAKT_API_KEY = os.getenv('INFAKT_API_KEY')
 HOST = os.getenv('INFAKT_HOST', 'api.infakt.pl')
@@ -94,18 +92,17 @@ def orders_create():
     }
 
     resp = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
-if not resp.ok:
-    app.logger.error(f"[inFakt VAT ERROR] status={resp.status_code}, body={resp.text}")
-    resp.raise_for_status()
+    if not resp.ok:
+        app.logger.error(f"[inFakt VAT ERROR] status={resp.status_code}, body={resp.text}")
+        resp.raise_for_status()
 
-resp_json = resp.json()
-app.logger.info(f"Pełna odpowiedź API: {resp_json}")  # tutaj zalogujesz całą odpowiedź
+    resp_json = resp.json()
+    app.logger.info(f"Pełna odpowiedź API: {resp_json}")
 
-invoice_uuid = resp_json.get('id')
-if not invoice_uuid:
-    app.logger.error("Brak invoice_uuid w odpowiedzi!")
-    abort(500, "Brak invoice_uuid w odpowiedzi API")
-
+    invoice_uuid = resp_json.get('id')
+    if not invoice_uuid:
+        app.logger.error("Brak invoice_uuid w odpowiedzi!")
+        abort(500, "Brak invoice_uuid w odpowiedzi API")
 
     mark_paid_url = f'https://{HOST}/api/v3/async/invoices/{invoice_uuid}/paid.json'
     paid_resp = requests.post(mark_paid_url, headers=HEADERS)
