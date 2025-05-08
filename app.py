@@ -99,7 +99,7 @@ def orders_create():
     resp_json = resp.json()
     app.logger.info(f"Pełna odpowiedź API: {resp_json}")
 
-    invoice_uuid = resp_json.get('id')
+    invoice_uuid = resp_json.get('uuid')
     if not invoice_uuid:
         app.logger.error("Brak invoice_uuid w odpowiedzi!")
         abort(500, "Brak invoice_uuid w odpowiedzi API")
