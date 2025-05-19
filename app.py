@@ -54,7 +54,7 @@ def orders_create():
     if nip:
         client_fields['client_tax_code'] = nip
 
-    
+
 services = []
 
 for item in order.get('line_items', []):
