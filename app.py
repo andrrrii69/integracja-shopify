@@ -77,20 +77,21 @@ def orders_create():
             'flat_rate_tax_symbol': '3',
         })
 
-    # Dodanie osobnej pozycji "Rabat", jeśli było total_discounts > 0
+    # Obliczamy sumy netto i VAT dla wszystkich pozycji
+    total_net_cents = sum(s['unit_net_price'] * s['quantity'] for s in services)
+    total_tax_cents = sum(s['tax_price'] for s in services)
+
+    # Dodanie osobnej pozycji 'Rabat', jeśli było total_discounts > 0
     discount_value = float(order.get('total_discounts', 0))
     if discount_value > 0:
-        discount_gross = int(round(discount_value * 100))
-        discount_net = int(round(discount_gross / 1.23))
-        discount_tax = discount_gross - discount_net
         services.append({
             'name': 'Rabat',
             'tax_symbol': '23',
             'quantity': 1,
-            'unit_net_price': -discount_net,
-            'unit_cost': -discount_net,
-            'gross_price': -discount_gross,
-            'tax_price': -discount_tax,
+            'unit_net_price': -total_net_cents,
+            'unit_cost': -total_net_cents,
+            'gross_price': -(total_net_cents + total_tax_cents),
+            'tax_price': -total_tax_cents,
             'flat_rate_tax_symbol': '3',
         })
 
