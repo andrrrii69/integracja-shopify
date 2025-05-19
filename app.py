@@ -20,13 +20,18 @@ HEADERS = {
     'Accept': 'application/json',
 }
 
+
 def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
-    computed = base64.b64encode(hmac.new(SHOPIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest())
+    computed = base64.b64encode(
+        hmac.new(SHOPIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest()
+    )
     return hmac.compare_digest(computed.decode('utf-8'), hmac_header)
+
 
 @app.route('/', methods=['GET'])
 def healthcheck():
     return 'OK', 200
+
 
 @app.route('/webhook/orders/create', methods=['POST'])
 def orders_create():
@@ -54,44 +59,47 @@ def orders_create():
     if nip:
         client_fields['client_tax_code'] = nip
 
+    # Budujemy listę usług (pozycji) na fakturze
+    services = []
+    for item in order.get('line_items', []):
+        qty = item['quantity']
+        gross_per_unit = int(round(float(item['price']) * 100))
+        net_unit = int(round(gross_per_unit / 1.23))
+        tax_unit = gross_per_unit - net_unit
+        services.append({
+            'name': item['title'],
+            'tax_symbol': '23',
+            'quantity': qty,
+            'unit_net_price': net_unit,
+            'unit_cost': net_unit,
+            'gross_price': gross_per_unit * qty,
+            'tax_price': tax_unit * qty,
+            'flat_rate_tax_symbol': '3',
+        })
 
-services = []
+    # Dodanie osobnej pozycji "Rabat", jeśli było total_discounts > 0
+    discount_value = float(order.get('total_discounts', 0))
+    if discount_value > 0:
+        discount_gross = int(round(discount_value * 100))
+        discount_net = int(round(discount_gross / 1.23))
+        discount_tax = discount_gross - discount_net
+        services.append({
+            'name': 'Rabat',
+            'tax_symbol': '23',
+            'quantity': 1,
+            'unit_net_price': -discount_net,
+            'unit_cost': -discount_net,
+            'gross_price': -discount_gross,
+            'tax_price': -discount_tax,
+            'flat_rate_tax_symbol': '3',
+        })
 
-for item in order.get('line_items', []):
-    qty = item['quantity']
-    gross_per_unit = int(round(float(item['price']) * 100))
-    net_unit = int(round(gross_per_unit / 1.23))
-    tax_unit = gross_per_unit - net_unit
-    services.append({
-        'name': item['title'],
-        'tax_symbol': '23',
-        'quantity': qty,
-        'unit_net_price': net_unit,
-        'unit_cost': net_unit,
-        'gross_price': gross_per_unit * qty,
-        'tax_price': tax_unit * qty,
-        'flat_rate_tax_symbol': '3',
-    })
+    created = datetime.strptime(order['created_at'], '%Y-%m-%dT%H:%M:%S%z')
+    sell_date = created.date().isoformat()
+    issue_date = sell_date
+    due_date = (created + timedelta(days=7)).date().isoformat()
 
-# Dodanie osobnej pozycji "Rabat", jeśli jest rabat w zamówieniu
-discount_value = float(order.get('total_discounts', 0))
-if discount_value > 0:
-    discount_gross = int(round(discount_value * 100))
-    discount_net = int(round(discount_gross / 1.23))
-    discount_tax = discount_gross - discount_net
-    services.append({
-        'name': 'Rabat',
-        'tax_symbol': '23',
-        'quantity': 1,
-        'unit_net_price': -discount_net,
-        'unit_cost': -discount_net,
-        'gross_price': -discount_gross,
-        'tax_price': -discount_tax,
-        'flat_rate_tax_symbol': '3',
-    })
-
-
-payload = {
+    payload = {
         'invoice': {
             'kind': 'vat',
             'series': os.getenv('INFAKT_SERIES', 'A'),
@@ -130,5 +138,7 @@ payload = {
 
     return '', 200
 
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+
