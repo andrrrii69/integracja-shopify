@@ -151,17 +151,16 @@ def orders_create():
 
     return '', 200
 
-@app.route('/webhook/refunds/create', methods=['POST'])
-def refunds_create():
+@app.route('/webhook/orders/cancelled', methods=['POST'])
+def orders_cancelled():
     raw = request.get_data()
     signature = request.headers.get('X-Shopify-Hmac-Sha256', '')
     if not verify_shopify_webhook(raw, signature):
         abort(401, 'Invalid HMAC signature')
 
-    refund = request.get_json()
-    order_id = str(refund.get('order_id'))
+    order = request.get_json()
+    order_id = str(order.get('id'))
 
-    # Szukamy faktury po external_id = order_id
     search_url = f'https://{HOST}/api/v3/invoices.json?external_id={order_id}'
     search_resp = requests.get(search_url, headers=HEADERS)
     if not search_resp.ok or not search_resp.json():
@@ -171,11 +170,9 @@ def refunds_create():
     invoice = search_resp.json()[0]
     invoice_uuid = invoice['uuid']
 
-    # Tworzymy korektę z pozycji refundowanych
     corrected_services = []
-    for refund_line in refund.get('refund_line_items', []):
-        item = refund_line['line_item']
-        qty = refund_line['quantity']
+    for item in order.get('line_items', []):
+        qty = item['quantity']
         gross = int(round(float(item['price']) * 100))
         net = int(round(gross / 1.23))
         tax = gross - net
@@ -189,26 +186,9 @@ def refunds_create():
             'flat_rate_tax_symbol': '3'
         })
 
-    # Korekta wysyłki, jeśli występuje refund shipping
-    for shipping in refund.get('shipping', []):
-        amount = float(shipping.get('amount', 0))
-        if amount > 0:
-            gross = int(round(amount * 100))
-            net = int(round(gross / 1.23))
-            tax = gross - net
-            corrected_services.append({
-                'name': f"Zwrot wysyłki - {shipping.get('title', 'dostawa')}",
-                'tax_symbol': '23',
-                'quantity': -1,
-                'unit_net_price': net,
-                'gross_price': -gross,
-                'tax_price': -tax,
-                'flat_rate_tax_symbol': '3'
-            })
-
     correction_payload = {
         'correction': {
-            'reason': 'Zwrot zamówienia',
+            'reason': 'Anulowanie zamówienia w Shopify',
             'services': corrected_services
         }
     }
@@ -219,10 +199,11 @@ def refunds_create():
         app.logger.error(f"[inFakt CORRECTION ERROR] status={correction_resp.status_code}, body={correction_resp.text}")
         correction_resp.raise_for_status()
     else:
-        app.logger.info("Korekta wystawiona poprawnie.")
+        app.logger.info("Korekta (anulowanie) wystawiona poprawnie.")
 
     return '', 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+
 
