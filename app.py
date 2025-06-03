@@ -20,18 +20,15 @@ HEADERS = {
     'Accept': 'application/json',
 }
 
-
 def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
     computed = base64.b64encode(
         hmac.new(SHOPIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest()
     )
     return hmac.compare_digest(computed.decode('utf-8'), hmac_header)
 
-
 @app.route('/', methods=['GET'])
 def healthcheck():
     return 'OK', 200
-
 
 @app.route('/webhook/orders/create', methods=['POST'])
 def orders_create():
@@ -59,7 +56,6 @@ def orders_create():
     if nip:
         client_fields['client_tax_code'] = nip
 
-    # Budujemy listę usług (pozycji) na fakturze
     services = []
     for item in order.get('line_items', []):
         qty = item['quantity']
@@ -77,7 +73,23 @@ def orders_create():
             'flat_rate_tax_symbol': '3',
         })
 
-    # Dodanie osobnej pozycji 'Rabat', jeśli było total_discounts > 0
+    for shipping_line in order.get('shipping_lines', []):
+        shipping_price = float(shipping_line.get('price', 0))
+        if shipping_price > 0:
+            gross = int(round(shipping_price * 100))
+            net = int(round(gross / 1.23))
+            tax = gross - net
+            services.append({
+                'name': f"Wysyłka - {shipping_line.get('title', 'dostawa')}",
+                'tax_symbol': '23',
+                'quantity': 1,
+                'unit_net_price': net,
+                'unit_cost': net,
+                'gross_price': gross,
+                'tax_price': tax,
+                'flat_rate_tax_symbol': '3',
+            })
+
     discount_value = float(order.get('total_discounts', 0))
     if discount_value > 0:
         discount_gross = int(round(discount_value * 100))
@@ -137,7 +149,6 @@ def orders_create():
         app.logger.info("Invoice successfully marked as paid.")
 
     return '', 200
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
