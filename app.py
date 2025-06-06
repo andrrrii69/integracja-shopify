@@ -30,124 +30,87 @@ def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
 def healthcheck():
     return 'OK', 200
 
-@app.route('/webhook/orders/create', methods=['POST'])
-def orders_create():
+@app.route('/webhook/refunds/create', methods=['POST'])
+def refunds_create():
     raw = request.get_data()
     signature = request.headers.get('X-Shopify-Hmac-Sha256', '')
     if not verify_shopify_webhook(raw, signature):
         abort(401, 'Invalid HMAC signature')
 
-    order = request.get_json()
-    billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
+    refund = request.get_json()
+    order_id = str(refund.get('order_id'))
 
-    nip = billing.get('nip') or billing.get('company_nip')
-    activity_kind = 'other_business' if nip else 'private_person'
+    search_url = f'https://{HOST}/api/v3/invoices.json?external_id={order_id}'
+    search_resp = requests.get(search_url, headers=HEADERS)
+    if not search_resp.ok or not search_resp.json():
+        app.logger.error(f"Nie znaleziono faktury do zamówienia {order_id}")
+        return '', 200
 
-    client_fields = {
-        'client_first_name': billing.get('first_name', ''),
-        'client_last_name': billing.get('last_name', ''),
-        'client_company_name': billing.get('company', ''),
-        'client_street': billing.get('address1', ''),
-        'client_flat_number': billing.get('address2', ''),
-        'client_city': billing.get('city', ''),
-        'client_post_code': billing.get('zip', ''),
-        'client_business_activity_kind': activity_kind,
-    }
-    if nip:
-        client_fields['client_tax_code'] = nip
+    invoice = search_resp.json()[0]
+    invoice_uuid = invoice['uuid']
 
-    services = []
-    for item in order.get('line_items', []):
-        qty = item['quantity']
-        gross_per_unit = int(round(float(item['price']) * 100))
-        net_unit = int(round(gross_per_unit / 1.23))
-        tax_unit = gross_per_unit - net_unit
-        services.append({
+    corrected_services = []
+    for refund_line in refund.get('refund_line_items', []):
+        item = refund_line['line_item']
+        qty = refund_line['quantity']
+        gross = int(round(float(item['price']) * 100))
+        net = int(round(gross / 1.23))
+        tax = gross - net
+        corrected_services.append({
             'name': item['title'],
             'tax_symbol': '23',
-            'quantity': qty,
-            'unit_net_price': net_unit,
-            'unit_cost': net_unit,
-            'gross_price': gross_per_unit * qty,
-            'tax_price': tax_unit * qty,
-            'flat_rate_tax_symbol': '3',
+            'quantity': -qty,
+            'unit_net_price': net,
+            'gross_price': -gross * qty,
+            'tax_price': -tax * qty,
+            'flat_rate_tax_symbol': '3'
         })
 
-    for shipping_line in order.get('shipping_lines', []):
-        shipping_price = float(shipping_line.get('price', 0))
-        if shipping_price > 0:
-            gross = int(round(shipping_price * 100))
+    for shipping in refund.get('shipping', []):
+        amount = float(shipping.get('amount', 0))
+        if amount >= 0:
+            gross = int(round(amount * 100))
             net = int(round(gross / 1.23))
             tax = gross - net
-            services.append({
-                'name': f"Wysyłka - {shipping_line.get('title', 'dostawa')}",
+            corrected_services.append({
+                'name': f"Zwrot wysyłki - {shipping.get('title', 'dostawa')}",
                 'tax_symbol': '23',
-                'quantity': 1,
+                'quantity': -1,
                 'unit_net_price': net,
-                'unit_cost': net,
-                'gross_price': gross,
-                'tax_price': tax,
-                'flat_rate_tax_symbol': '3',
+                'gross_price': -gross,
+                'tax_price': -tax,
+                'flat_rate_tax_symbol': '3'
             })
 
-    discount_value = float(order.get('total_discounts', 0))
-    if discount_value > 0:
-        discount_gross = int(round(discount_value * 100))
+    total_discount = float(refund.get('order_adjustments', [{}])[0].get('amount', 0))
+    if total_discount:
+        discount_gross = int(round(abs(total_discount) * 100))
         discount_net = int(round(discount_gross / 1.23))
         discount_tax = discount_gross - discount_net
-        services.append({
+        corrected_services.append({
             'name': 'Rabat',
             'tax_symbol': '23',
-            'quantity': 1,
-            'unit_net_price': -discount_net,
-            'unit_cost': -discount_net,
+            'quantity': -1,
+            'unit_net_price': discount_net,
             'gross_price': -discount_gross,
             'tax_price': -discount_tax,
-            'flat_rate_tax_symbol': '3',
+            'flat_rate_tax_symbol': '3'
         })
 
-    created = datetime.strptime(order['created_at'], '%Y-%m-%dT%H:%M:%S%z')
-    sell_date = created.date().isoformat()
-    issue_date = sell_date
-    due_date = (created + timedelta(days=7)).date().isoformat()
-
-    payload = {
-        'invoice': {
-            'kind': 'vat',
-            'series': os.getenv('INFAKT_SERIES', 'A'),
-            'status': 'issued',
-            'sell_date': sell_date,
-            'issue_date': issue_date,
-            'payment_due_date': due_date,
-            'payment_method': 'transfer',
-            'currency': 'PLN',
-            'external_id': str(order['id']),
-            **client_fields,
-            'services': services
+    correction_payload = {
+        'correction': {
+            'reason': 'Zwrot zamówienia',
+            'services': corrected_services
         }
     }
 
-    resp = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
-    if not resp.ok:
-        app.logger.error(f"[inFakt VAT ERROR] status={resp.status_code}, body={resp.text}")
-        resp.raise_for_status()
-
-    resp_json = resp.json()
-    app.logger.info(f"Pełna odpowiedź API: {resp_json}")
-
-    invoice_uuid = resp_json.get('uuid')
-    if not invoice_uuid:
-        app.logger.error("Brak invoice_uuid w odpowiedzi!")
-        abort(500, "Brak invoice_uuid w odpowiedzi API")
-
-    mark_paid_url = f'https://{HOST}/api/v3/async/invoices/{invoice_uuid}/paid.json'
-    paid_resp = requests.post(mark_paid_url, headers=HEADERS)
-
-    if paid_resp.status_code != 201:
-        app.logger.error(f"[inFakt PAID ERROR] status={paid_resp.status_code}, body={paid_resp.text}")
-        paid_resp.raise_for_status()
+    correction_url = f'https://{HOST}/api/v3/invoices/{invoice_uuid}/correction.json'
+    correction_resp = requests.post(correction_url, json=correction_payload, headers=HEADERS)
+    if not correction_resp.ok:
+        app.logger.error(f"[inFakt CORRECTION ERROR] status={correction_resp.status_code}, body={correction_resp.text}")
+        correction_resp.raise_for_status()
     else:
-        app.logger.info("Invoice successfully marked as paid.")
+        app.logger.info("Korekta (zwrot) wystawiona poprawnie.")
 
     return '', 200
 
@@ -186,6 +149,36 @@ def orders_cancelled():
             'flat_rate_tax_symbol': '3'
         })
 
+    for shipping_line in order.get('shipping_lines', []):
+        shipping_price = float(shipping_line.get('price', 0))
+        gross = int(round(shipping_price * 100))
+        net = int(round(gross / 1.23))
+        tax = gross - net
+        corrected_services.append({
+            'name': f"Zwrot wysyłki - {shipping_line.get('title', 'dostawa')}",
+            'tax_symbol': '23',
+            'quantity': -1,
+            'unit_net_price': net,
+            'gross_price': -gross,
+            'tax_price': -tax,
+            'flat_rate_tax_symbol': '3'
+        })
+
+    total_discount = float(order.get('total_discounts', 0))
+    if total_discount:
+        discount_gross = int(round(total_discount * 100))
+        discount_net = int(round(discount_gross / 1.23))
+        discount_tax = discount_gross - discount_net
+        corrected_services.append({
+            'name': 'Rabat',
+            'tax_symbol': '23',
+            'quantity': -1,
+            'unit_net_price': discount_net,
+            'gross_price': -discount_gross,
+            'tax_price': -discount_tax,
+            'flat_rate_tax_symbol': '3'
+        })
+
     correction_payload = {
         'correction': {
             'reason': 'Anulowanie zamówienia w Shopify',
@@ -205,5 +198,4 @@ def orders_cancelled():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
-
 
