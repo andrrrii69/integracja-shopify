@@ -123,9 +123,25 @@ def create_invoice(order):
 def create_correction(order, reason):
     oid = str(order.get('id'))
     r = requests.get(f'https://{HOST}/api/v3/invoices.json?external_id={oid}', headers=HEADERS)
-    if not r.ok or not r.json():
-        app.logger.warning(f"Brak faktury {oid}")
+    if not r.ok:
+        app.logger.error(f"[SEARCH ERROR] status={r.status_code}, body={r.text}")
         return False
+    data = r.json()
+    # obsługa odpowiedzi jako listy lub dict z kluczem 'invoices'
+    invoices = data if isinstance(data, list) else data.get('invoices', [])
+    if not invoices:
+        app.logger.warning(f"Brak faktury dla zamówienia {oid}")
+        return False
+    invoice_uuid = invoices[0].get('uuid')
+    if not invoice_uuid:
+        app.logger.error(f"Brak UUID faktury w odpowiedzi dla zamówienia {oid}")
+        return False
+    payload = {'correction': {'reason': reason, 'services': prepare_services(order)}}
+    c = requests.post(f'https://{HOST}/api/v3/invoices/{invoice_uuid}/correction.json', json=payload, headers=HEADERS)
+    if not c.ok:
+        app.logger.error(f"[CORR ERROR] status={c.status_code}, body={c.text}")
+        return False
+    return True
     uuid = r.json()[0]['uuid']
     payload = {'correction': {'reason': reason, 'services': prepare_services(order)}}
     c = requests.post(f'https://{HOST}/api/v3/invoices/{uuid}/correction.json', json=payload, headers=HEADERS)
