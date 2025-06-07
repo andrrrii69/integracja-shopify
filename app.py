@@ -22,7 +22,7 @@ HEADERS = {
 
 def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
     computed = base64.b64encode(
-        hmac.new(SHIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest()
+        hmac.new(SHOPIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest()
     )
     return hmac.compare_digest(computed.decode('utf-8'), hmac_header)
 
