@@ -44,11 +44,14 @@ def prepare_services(order):
             'tax_price': tax * qty,
             'flat_rate_tax_symbol': '3'
         })
-    # wysyłka
+        # wysyłka
     for shipping in order.get('shipping_lines', []):
         amount = float(shipping.get('price', 0))
+        # pomijamy darmową wysyłkę
+        if amount <= 0:
+            continue
         gross = int(round(amount * 100))
-        net = int(round(gross / 1.23)) if gross > 0 else 0
+        net = int(round(gross / 1.23))
         tax = gross - net
         services.append({
             'name': f"Wysyłka - {shipping.get('title', 'dostawa')}",
