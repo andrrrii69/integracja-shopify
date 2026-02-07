@@ -28,22 +28,26 @@ def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
 def prepare_services(order):
     services = []
     
-    # 1. Produkty - Wyliczanie ceny netto z danych Shopify
+    # 1. Produkty - pobieramy wartości już po rabatach (discount_allocations)
     for item in order.get('line_items', []):
         qty = item['quantity']
         
-        # Shopify podaje cenę jednostkową brutto
-        gross_unit_grosze = int(round(float(item['price']) * 100))
-        total_gross_grosze = gross_unit_grosze * qty
+        # Całkowite brutto za pozycję po rabatach (Shopify: total_line_items_price - total_discount)
+        # Najbezpieczniej obliczyć to jako: (cena_brutto * qty) - suma_rabatów_dla_linii
+        line_gross_total = float(item['price']) * qty
+        line_discount = sum(float(disc.get('amount', 0)) for disc in item.get('discount_allocations', []))
+        line_gross_after_discount = line_gross_total - line_discount
+
+        # Pobieramy podatek doliczony przez Shopify dla tej konkretnej linii (już po rabacie)
+        line_tax_total = sum(float(tax.get('price', 0)) for tax in item.get('tax_lines', []))
         
-        # Pobieramy faktyczną kwotę podatku dla tej pozycji z Shopify
-        item_tax_total_grosze = int(round(sum(float(tax.get('price', 0)) for tax in item.get('tax_lines', [])) * 100))
+        # Wyliczamy czyste netto w groszach
+        total_net_grosze = int(round((line_gross_after_discount - line_tax_total) * 100))
         
-        # Obliczamy czyste netto: Brutto - Podatek
-        total_net_grosze = total_gross_grosze - item_tax_total_grosze
-        unit_net_price_grosze = int(round(total_net_grosze / qty))
+        # Cena jednostkowa netto dla inFakt
+        unit_net_price_grosze = int(round(total_net_grosze / qty)) if qty > 0 else 0
         
-        # Wyznaczanie symbolu podatku (np. "23")
+        # Wyznaczanie symbolu podatku
         tax_symbol = "23"
         if item.get('tax_lines'):
             rate = float(item['tax_lines'][0].get('rate', 0.23))
@@ -53,19 +57,18 @@ def prepare_services(order):
             'name': item['title'],
             'tax_symbol': tax_symbol,
             'quantity': qty,
-            'unit_net_price': unit_net_price_grosze, # Wysyłamy TYLKO netto
+            'unit_net_price': unit_net_price_grosze,
             'flat_rate_tax_symbol': '3'
         })
 
-    # 2. Wysyłka - Wyliczanie netto
+    # 2. Wysyłka - darmowa wysyłka również będzie miała cenę 0 netto
     for shipping in order.get('shipping_lines', []):
-        amount_gross = float(shipping.get('price', 0))
-        if amount_gross <= 0:
-            continue
+        # Shopify podaje 'price' jako cenę przed rabatem na wysyłkę, sprawdzamy 'discounted_price'
+        gross_ship = float(shipping.get('discounted_price', shipping.get('price', 0)))
+        if gross_ship < 0: gross_ship = 0
             
-        gross_grosze = int(round(amount_gross * 100))
-        tax_grosze = int(round(sum(float(tax.get('price', 0)) for tax in shipping.get('tax_lines', [])) * 100))
-        net_grosze = gross_grosze - tax_grosze
+        tax_ship = sum(float(tax.get('price', 0)) for tax in shipping.get('tax_lines', []))
+        net_ship_grosze = int(round((gross_ship - tax_ship) * 100))
         
         ship_tax_symbol = "23"
         if shipping.get('tax_lines'):
@@ -76,27 +79,12 @@ def prepare_services(order):
             'name': f"Wysyłka - {shipping.get('title', 'dostawa')}",
             'tax_symbol': ship_tax_symbol,
             'quantity': 1,
-            'unit_net_price': net_grosze, # Wysyłamy TYLKO netto
-            'flat_rate_tax_symbol': '3'
-        })
-
-    # 3. Rabaty
-    discount_value = float(order.get('total_discounts', 0))
-    if discount_value > 0:
-        gross_disc_grosze = int(round(discount_value * 100))
-        # Dla rabatu musimy wyliczyć bazę netto (zakładamy 23% VAT dla rabatu ogólnego)
-        net_disc_grosze = int(round(gross_disc_grosze / 1.23))
-        
-        services.append({
-            'name': 'Rabat',
-            'tax_symbol': '23',
-            'quantity': 1,
-            'unit_net_price': -net_disc_grosze,
+            'unit_net_price': net_ship_grosze,
             'flat_rate_tax_symbol': '3'
         })
         
     return services
-
+    
 @app.route('/', methods=['GET'])
 def healthcheck():
     return 'OK', 200
