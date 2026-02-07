@@ -28,17 +28,20 @@ def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
 def prepare_services(order):
     services = []
     
-    # 1. Produkty
+    # 1. Produkty - Wyliczanie ceny netto z danych Shopify
     for item in order.get('line_items', []):
         qty = item['quantity']
-        # Cena jednostkowa brutto z Shopify
-        gross_unit_grosze = int(round(float(item['price']) * 100))
         
-        # Podatek sumaryczny dla tej pozycji z tax_lines
+        # Shopify podaje cenę jednostkową brutto
+        gross_unit_grosze = int(round(float(item['price']) * 100))
+        total_gross_grosze = gross_unit_grosze * qty
+        
+        # Pobieramy faktyczną kwotę podatku dla tej pozycji z Shopify
         item_tax_total_grosze = int(round(sum(float(tax.get('price', 0)) for tax in item.get('tax_lines', [])) * 100))
         
-        total_gross_grosze = gross_unit_grosze * qty
+        # Obliczamy czyste netto: Brutto - Podatek
         total_net_grosze = total_gross_grosze - item_tax_total_grosze
+        unit_net_price_grosze = int(round(total_net_grosze / qty))
         
         # Wyznaczanie symbolu podatku (np. "23")
         tax_symbol = "23"
@@ -50,13 +53,11 @@ def prepare_services(order):
             'name': item['title'],
             'tax_symbol': tax_symbol,
             'quantity': qty,
-            'unit_net_price': int(round(total_net_grosze / qty)),
-            'gross_price': total_gross_grosze,
-            'tax_price': item_tax_total_grosze,
+            'unit_net_price': unit_net_price_grosze, # Wysyłamy TYLKO netto
             'flat_rate_tax_symbol': '3'
         })
 
-    # 2. Wysyłka
+    # 2. Wysyłka - Wyliczanie netto
     for shipping in order.get('shipping_lines', []):
         amount_gross = float(shipping.get('price', 0))
         if amount_gross <= 0:
@@ -75,27 +76,22 @@ def prepare_services(order):
             'name': f"Wysyłka - {shipping.get('title', 'dostawa')}",
             'tax_symbol': ship_tax_symbol,
             'quantity': 1,
-            'unit_net_price': net_grosze,
-            'gross_price': gross_grosze,
-            'tax_price': tax_grosze,
+            'unit_net_price': net_grosze, # Wysyłamy TYLKO netto
             'flat_rate_tax_symbol': '3'
         })
 
     # 3. Rabaty
     discount_value = float(order.get('total_discounts', 0))
     if discount_value > 0:
-        gross_disc = int(round(discount_value * 100))
-        # Przyjmujemy 23% dla rabatu ogólnego (standardowa praktyka przy braku rozbicia)
-        net_disc = int(round(gross_disc / 1.23))
-        tax_disc = gross_disc - net_disc
+        gross_disc_grosze = int(round(discount_value * 100))
+        # Dla rabatu musimy wyliczyć bazę netto (zakładamy 23% VAT dla rabatu ogólnego)
+        net_disc_grosze = int(round(gross_disc_grosze / 1.23))
         
         services.append({
             'name': 'Rabat',
             'tax_symbol': '23',
             'quantity': 1,
-            'unit_net_price': -net_disc,
-            'gross_price': -gross_disc,
-            'tax_price': -tax_disc,
+            'unit_net_price': -net_disc_grosze,
             'flat_rate_tax_symbol': '3'
         })
         
@@ -107,7 +103,6 @@ def healthcheck():
 
 def create_invoice(order):
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
-    # Shopify przechowuje NIP często w polach 'company' lub metaforach, tu mapujemy standard
     nip = billing.get('company') if (billing.get('company') and any(char.isdigit() for char in billing.get('company'))) else None
     
     activity = 'other_business' if nip else 'private_person'
@@ -124,7 +119,6 @@ def create_invoice(order):
     if nip:
         client['client_tax_code'] = nip
 
-    # Obsługa formatu daty z Shopify (z uwzględnieniem strefy czasowej)
     created_str = order['created_at'].split('T')[0]
     sell = created_str 
     due = (datetime.strptime(sell, '%Y-%m-%d') + timedelta(days=7)).date().isoformat()
@@ -145,7 +139,6 @@ def create_invoice(order):
     
     r = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
     if not r.ok:
-        app.logger.error(f"[VAT ERROR] {r.status_code} {r.text}")
         return None
         
     uuid = r.json().get('uuid')
@@ -161,7 +154,6 @@ def create_correction(order, reason):
     
     data = r.json()
     invoices = data.get('invoices', []) if isinstance(data, dict) else data
-    
     if not invoices:
         return False
         
@@ -181,8 +173,7 @@ def orders_create():
     raw, sig = request.get_data(), request.headers.get('X-Shopify-Hmac-Sha256','')
     if not verify_shopify_webhook(raw, sig): abort(401)
     order = request.get_json()
-    if create_invoice(order): 
-        app.logger.info(f"Invoice for order {order['id']} created")
+    create_invoice(order)
     return '', 200
 
 @app.route('/webhook/orders/updated', methods=['POST'])
