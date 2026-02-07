@@ -20,8 +20,7 @@ HEADERS = {
 }
 
 def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
-    if not hmac_header:
-        return False
+    if not hmac_header: return False
     computed = base64.b64encode(
         hmac.new(SHOPIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest()
     )
@@ -29,30 +28,37 @@ def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
 
 def prepare_services(order):
     services = []
+    # Liczymy sumę brutto tak, jak wyliczy ją inFakt (w groszach), by potem skorygować różnice
     calculated_total_gross_grosze = 0
     
+    # 1. Produkty
     for item in order.get('line_items', []):
         qty = int(item['quantity'])
         unit_gross_float = float(item['price'])
         
+        # Pobieranie stawki VAT (np. 0.23)
         rate = 0.23
         if item.get('tax_lines'):
             rate = float(item['tax_lines'][0].get('rate', 0.23))
         
         tax_symbol = str(int(rate * 100))
-        unit_net_grosze = int(round((unit_gross_float / (1 + rate)) * 100))
         
-        line_gross_grosze = int(round(unit_net_grosze * qty * (1 + rate)))
+        # Obliczamy Netto w groszach: (Brutto / (1 + rate)) * 100
+        unit_net_price_grosze = int(round((unit_gross_float / (1 + rate)) * 100))
+        
+        # Ile inFakt wyliczy brutto za tę linię: Netto * Qty * (1 + rate)
+        line_gross_grosze = int(round(unit_net_price_grosze * qty * (1 + rate)))
         calculated_total_gross_grosze += line_gross_grosze
 
         services.append({
             'name': item['title'],
             'tax_symbol': tax_symbol,
             'quantity': qty,
-            'unit_net_price': unit_net_grosze,
+            'unit_net_price': unit_net_price_grosze, # inFakt v3 przyjmuje grosze
             'flat_rate_tax_symbol': '3'
         })
 
+    # 2. Wysyłka
     for shipping in order.get('shipping_lines', []):
         ship_gross_float = float(shipping.get('price', 0))
         if ship_gross_float > 0:
@@ -62,6 +68,7 @@ def prepare_services(order):
             
             ship_tax_symbol = str(int(ship_rate * 100))
             ship_net_grosze = int(round((ship_gross_float / (1 + ship_rate)) * 100))
+            
             calculated_total_gross_grosze += int(round(ship_net_grosze * 1 * (1 + ship_rate)))
             
             services.append({
@@ -72,10 +79,13 @@ def prepare_services(order):
                 'flat_rate_tax_symbol': '3'
             })
 
+    # 3. Korekta groszowa (Rabat/Dopłata)
+    # Kwota którą faktycznie zapłacił klient w Shopify (w groszach)
     target_total_gross_grosze = int(round(float(order.get('total_price', 0)) * 100))
     diff_grosze = calculated_total_gross_grosze - target_total_gross_grosze
 
     if diff_grosze != 0:
+        # Dodajemy usługę wyrównującą, aby suma końcowa się zgadzała
         services.append({
             'name': 'Korekta zaokrągleń',
             'tax_symbol': '23',
@@ -87,32 +97,38 @@ def prepare_services(order):
     return services
 
 def create_invoice(order):
+    # Wyciąganie danych adresowych z payloadu
     billing = order.get('billing_address') or {}
+    customer = order.get('customer', {})
     
-    # NAPRAWA BŁĘDU: Dodanie or '' zapewnia, że company_field to zawsze string, a nie None
-    company_field = billing.get('company') or ''
-    nip = "".join(filter(str.isdigit, company_field))
+    first_name = billing.get('first_name') or customer.get('first_name') or "Klient"
+    last_name = billing.get('last_name') or customer.get('last_name') or "Detaliczny"
     
-    is_business = len(nip) == 10
-    activity = 'other_business' if is_business else 'private_person'
+    # Obsługa NIP (w Twoim payloadzie NIP jest w polu 'company')
+    company_name = billing.get('company') or ""
+    nip = "".join(filter(str.isdigit, company_name))
+    if len(nip) != 10: nip = None # Jeśli to nie jest 10 cyfr, uznajemy za brak NIP
     
-    # Jeśli company_field jest puste, używamy imienia i nazwiska
-    client_name = company_field if company_field.strip() else f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
-
+    activity = 'other_business' if nip else 'private_person'
+    
+    sell_date = order['created_at'].split('T')[0]
+    
     payload = {
         'invoice': {
             'kind': 'vat',
             'series': os.getenv('INFAKT_SERIES', 'A'),
             'status': 'issued',
-            'sell_date': order['created_at'].split('T')[0],
-            'issue_date': order['created_at'].split('T')[0],
-            'payment_due_date': order['created_at'].split('T')[0],
+            'sell_date': sell_date,
+            'issue_date': sell_date,
+            'payment_due_date': sell_date,
             'payment_method': 'transfer',
             'currency': order.get('currency', 'PLN'),
             'external_id': str(order['id']),
-            'recipient_first_name': billing.get('first_name'),
-            'recipient_last_name': billing.get('last_name'),
-            'client_company_name': client_name,
+            # Dane klienta bezpośrednio w obiekcie invoice
+            'recipient_first_name': first_name,
+            'recipient_last_name': last_name,
+            'client_company_name': company_name if company_name else f"{first_name} {last_name}",
+            'client_tax_code': nip,
             'client_street': f"{billing.get('address1', '')} {billing.get('address2', '')}".strip(),
             'client_city': billing.get('city'),
             'client_post_code': billing.get('zip'),
@@ -121,21 +137,21 @@ def create_invoice(order):
             'services': prepare_services(order)
         }
     }
-    
-    if is_business:
-        payload['invoice']['client_tax_code'] = nip
 
     r = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
+    
     if not r.ok:
         app.logger.error(f"[INFAKT ERROR] {r.status_code}: {r.text}")
         return None
         
-    invoice_uuid = r.json().get('uuid')
+    invoice_data = r.json()
+    uuid = invoice_data.get('uuid')
     
-    if invoice_uuid and order.get('financial_status') == 'paid':
-        requests.post(f'https://{HOST}/api/v3/invoices/{invoice_uuid}/paid.json', headers=HEADERS)
+    # Oznaczanie jako opłacone
+    if uuid and order.get('financial_status') == 'paid':
+        requests.post(f'https://{HOST}/api/v3/invoices/{uuid}/paid.json', headers=HEADERS)
         
-    return invoice_uuid
+    return uuid
 
 @app.route('/webhook/orders/create', methods=['POST'])
 def orders_create():
@@ -146,13 +162,14 @@ def orders_create():
         abort(401)
         
     order = request.get_json()
-    uuid = create_invoice(order)
-    
-    return {'status': 'success', 'infakt_uuid': uuid}, 200
+    create_invoice(order)
+    return {'status': 'ok'}, 200
 
 @app.route('/', methods=['GET'])
 def health():
     return 'OK', 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 10000)))
+    # Render używa portu 10000 domyślnie
+    port = int(os.getenv('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
