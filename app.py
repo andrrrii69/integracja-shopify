@@ -29,17 +29,14 @@ def prepare_services(order):
     services = []
     total_gross_regular = 0
     
-    # 1. Produkty w cenach regularnych (pobieramy stawkę i podatek z Shopify)
+    # 1. Produkty w cenach regularnych
     for item in order.get('line_items', []):
         qty = item['quantity']
-        # Shopify podaje cenę brutto za sztukę
         unit_gross = float(item['price'])
         total_gross_regular += unit_gross * qty
         
-        # Wyciągamy podatek dla pojedynczej sztuki z Shopify (bez rabatu)
-        # Przy darmowych prezentach (GIFT) Shopify poda tu wartości dla ceny regularnej
         line_tax_money = sum(float(tax.get('price', 0)) for tax in item.get('tax_lines', []))
-        # Jeśli produkt jest prezentem (0zł w koszyku), obliczamy tax od ceny regularnej
+        
         if line_tax_money == 0 and unit_gross > 0:
             unit_tax = unit_gross - (unit_gross / 1.23)
         else:
@@ -47,7 +44,6 @@ def prepare_services(order):
             
         unit_net_price_grosze = int(round((unit_gross - unit_tax) * 100))
         
-        # Symbol podatku bezpośrednio z Shopify
         tax_symbol = "23"
         if item.get('tax_lines'):
             rate = float(item['tax_lines'][0].get('rate', 0.23))
@@ -61,15 +57,18 @@ def prepare_services(order):
             'flat_rate_tax_symbol': '3'
         })
 
-    # 2. Wysyłka w cenie regularnej
+    # 2. Wysyłka - USUNIĘTO 1.23
     total_shipping_gross = 0
     for shipping in order.get('shipping_lines', []):
         ship_gross = float(shipping.get('price', 0))
         total_shipping_gross += ship_gross
         
         if ship_gross > 0:
-            ship_tax = sum(float(tax.get('price', 0)) for tax in shipping.get('tax_lines', []))
-            ship_net_grosze = int(round((ship_gross - ship_tax) * 100))
+            # Pobieramy kwotę podatku bezpośrednio z Shopify
+            ship_tax_money = sum(float(tax.get('price', 0)) for tax in shipping.get('tax_lines', []))
+            
+            # Netto to różnica Brutto i Podatku z Shopify
+            ship_net_grosze = int(round((ship_gross - ship_tax_money) * 100))
             
             services.append({
                 'name': f"Wysyłka - {shipping.get('title')}",
@@ -79,15 +78,11 @@ def prepare_services(order):
                 'flat_rate_tax_symbol': '3'
             })
 
-    # 3. Rabat zbiorczy (różnica między sumą regularną a płatnością klienta)
+    # 3. Rabat zbiorczy
     total_paid_gross = float(order.get('total_price', 0))
     total_discount_gross = (total_gross_regular + total_shipping_gross) - total_paid_gross
 
     if total_discount_gross > 0.01:
-        # Pobieramy sumaryczny podatek z zamówienia, aby wyliczyć netto rabatu
-        total_tax_paid = float(order.get('total_tax', 0))
-        # Netto rabatu = Brutto rabatu - (Suma podatków regularnych - Podatek faktycznie zapłacony)
-        # Dla uproszczenia stosujemy proporcję 23% dla pozycji Rabat
         discount_net_grosze = int(round((total_discount_gross / 1.23) * 100))
         
         services.append({
@@ -140,7 +135,6 @@ def create_invoice(order):
     
     r = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
     if not r.ok:
-        app.logger.error(f"[VAT ERROR] {r.status_code} {r.text}")
         return None
         
     uuid = r.json().get('uuid')
