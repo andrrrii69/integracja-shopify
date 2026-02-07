@@ -27,63 +27,78 @@ def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
 
 def prepare_services(order):
     services = []
-    total_gross_regular = 0
     
-    # 1. Produkty w cenach regularnych
+    # Suma kontrolna, aby wyliczyć idealny rabat na końcu
+    calculated_invoice_total_gross = 0
+    
+    # 1. Produkty - Pobieranie stawki VAT dynamicznie z Shopify
     for item in order.get('line_items', []):
         qty = item['quantity']
         unit_gross = float(item['price'])
-        total_gross_regular += unit_gross * qty
         
-        line_tax_money = sum(float(tax.get('price', 0)) for tax in item.get('tax_lines', []))
-        
-        if line_tax_money == 0 and unit_gross > 0:
-            unit_tax = unit_gross - (unit_gross / 1.23)
-        else:
-            unit_tax = line_tax_money / qty if qty > 0 else 0
-            
-        unit_net_price_grosze = int(round((unit_gross - unit_tax) * 100))
-        
-        tax_symbol = "23"
+        # Pobieramy stawkę VAT (rate) konkretnie dla tego produktu
+        # np. 0.23 dla 23%, 0.08 dla 8%
+        rate = 0.23 # Domyślna bezpieczna wartość
         if item.get('tax_lines'):
             rate = float(item['tax_lines'][0].get('rate', 0.23))
-            tax_symbol = str(int(rate * 100))
+        
+        # Wyliczamy symbol podatku dla inFakt (np. "23", "8")
+        tax_symbol = str(int(rate * 100))
+        
+        # Obliczamy Netto dynamicznie: Cena Brutto / (1 + stawka)
+        # To eliminuje sztywne "1.23". Jeśli produkt ma 8%, podzieli przez 1.08
+        unit_net_grosze = int(round((unit_gross / (1 + rate)) * 100))
+        
+        # Symulujemy, ile inFakt wyliczy z tego brutto, aby potem wyrównać rabatem
+        # inFakt liczy: Netto * Ilość * (1 + stawka)
+        line_net_total = unit_net_grosze * qty
+        line_gross_in_infakt = int(round(line_net_total * (1 + rate))) / 100.0
+        calculated_invoice_total_gross += line_gross_in_infakt
 
         services.append({
             'name': item['title'],
             'tax_symbol': tax_symbol,
             'quantity': qty,
-            'unit_net_price': unit_net_price_grosze,
+            'unit_net_price': unit_net_grosze,
             'flat_rate_tax_symbol': '3'
         })
 
-    # 2. Wysyłka - USUNIĘTO 1.23
-    total_shipping_gross = 0
+    # 2. Wysyłka - Dynamiczna stawka VAT
     for shipping in order.get('shipping_lines', []):
         ship_gross = float(shipping.get('price', 0))
-        total_shipping_gross += ship_gross
         
         if ship_gross > 0:
-            # Pobieramy kwotę podatku bezpośrednio z Shopify
-            ship_tax_money = sum(float(tax.get('price', 0)) for tax in shipping.get('tax_lines', []))
+            # Pobieramy stawkę VAT dla wysyłki
+            ship_rate = 0.23
+            if shipping.get('tax_lines'):
+                ship_rate = float(shipping['tax_lines'][0].get('rate', 0.23))
             
-            # Netto to różnica Brutto i Podatku z Shopify
-            ship_net_grosze = int(round((ship_gross - ship_tax_money) * 100))
+            ship_tax_symbol = str(int(ship_rate * 100))
+            
+            # Netto = Brutto / (1 + stawka wysyłki)
+            ship_net_grosze = int(round((ship_gross / (1 + ship_rate)) * 100))
+            
+            # Dodajemy do sumy kontrolnej
+            ship_gross_in_infakt = int(round(ship_net_grosze * (1 + ship_rate))) / 100.0
+            calculated_invoice_total_gross += ship_gross_in_infakt
             
             services.append({
                 'name': f"Wysyłka - {shipping.get('title')}",
-                'tax_symbol': '23',
+                'tax_symbol': ship_tax_symbol,
                 'quantity': 1,
                 'unit_net_price': ship_net_grosze,
                 'flat_rate_tax_symbol': '3'
             })
 
-    # 3. Rabat zbiorczy
+    # 3. Rabat zbiorczy - wyrównanie do kwoty wpłaconej
     total_paid_gross = float(order.get('total_price', 0))
-    total_discount_gross = (total_gross_regular + total_shipping_gross) - total_paid_gross
+    diff_gross = calculated_invoice_total_gross - total_paid_gross
 
-    if total_discount_gross > 0.01:
-        discount_net_grosze = int(round((total_discount_gross / 1.23) * 100))
+    if diff_gross > 0.02:
+        # Rabat zazwyczaj ma stawkę podstawową (23%), chyba że wolisz inaczej.
+        # Tutaj zakładamy standardowe 23% dla usługi rabatowej.
+        discount_rate = 0.23 
+        discount_net_grosze = int(round((diff_gross / (1 + discount_rate)) * 100))
         
         services.append({
             'name': 'Rabat',
@@ -135,10 +150,11 @@ def create_invoice(order):
     
     r = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
     if not r.ok:
+        app.logger.error(f"[VAT ERROR] {r.status_code} {r.text}")
         return None
         
     uuid = r.json().get('uuid')
-    if uuid and order.get('financial_status') == 'paid':
+    if uuid and order.get('financial_status') in ['paid', 'partially_paid']:
         requests.post(f'https://{HOST}/api/v3/async/invoices/{uuid}/paid.json', headers=HEADERS)
     return uuid
 
