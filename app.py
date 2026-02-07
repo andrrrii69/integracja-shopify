@@ -9,6 +9,7 @@ import requests
 
 app = Flask(__name__)
 
+# Konfiguracja z Twojego środowiska
 SHOPIFY_WEBHOOK_SECRET = os.getenv('SHOPIFY_WEBHOOK_SECRET', '').encode('utf-8')
 INFAKT_API_KEY = os.getenv('INFAKT_API_KEY')
 HOST = os.getenv('INFAKT_HOST', 'api.infakt.pl')
@@ -29,25 +30,22 @@ def prepare_services(order):
     services = []
     total_gross_regular = 0
     
-    # 1. Produkty w cenach regularnych (pobieramy stawkę i podatek z Shopify)
+    # 1. Produkty w cenach regularnych
     for item in order.get('line_items', []):
         qty = item['quantity']
-        # Shopify podaje cenę brutto za sztukę
         unit_gross = float(item['price'])
         total_gross_regular += unit_gross * qty
         
-        # Wyciągamy podatek dla pojedynczej sztuki z Shopify (bez rabatu)
-        # Przy darmowych prezentach (GIFT) Shopify poda tu wartości dla ceny regularnej
+        # Pobieramy faktyczny podatek z Shopify dla linii
         line_tax_money = sum(float(tax.get('price', 0)) for tax in item.get('tax_lines', []))
-        # Jeśli produkt jest prezentem (0zł w koszyku), obliczamy tax od ceny regularnej
-        if line_tax_money == 0 and unit_gross > 0:
-            unit_tax = unit_gross - (unit_gross / 1.23)
-        else:
-            unit_tax = line_tax_money / qty if qty > 0 else 0
-            
-        unit_net_price_grosze = int(round((unit_gross - unit_tax) * 100))
         
-        # Symbol podatku bezpośrednio z Shopify
+        # Obliczamy netto: (Brutto - Podatek) / Ilość
+        if qty > 0:
+            unit_tax = line_tax_money / qty
+            unit_net_price_grosze = int(round((unit_gross - unit_tax) * 100))
+        else:
+            unit_net_price_grosze = 0
+            
         tax_symbol = "23"
         if item.get('tax_lines'):
             rate = float(item['tax_lines'][0].get('rate', 0.23))
@@ -61,7 +59,7 @@ def prepare_services(order):
             'flat_rate_tax_symbol': '3'
         })
 
-    # 2. Wysyłka w cenie regularnej
+    # 2. Wysyłka
     total_shipping_gross = 0
     for shipping in order.get('shipping_lines', []):
         ship_gross = float(shipping.get('price', 0))
@@ -79,17 +77,12 @@ def prepare_services(order):
                 'flat_rate_tax_symbol': '3'
             })
 
-    # 3. Rabat zbiorczy (różnica między sumą regularną a płatnością klienta)
+    # 3. Rabat zbiorczy
     total_paid_gross = float(order.get('total_price', 0))
     total_discount_gross = (total_gross_regular + total_shipping_gross) - total_paid_gross
 
     if total_discount_gross > 0.01:
-        # Pobieramy sumaryczny podatek z zamówienia, aby wyliczyć netto rabatu
-        total_tax_paid = float(order.get('total_tax', 0))
-        # Netto rabatu = Brutto rabatu - (Suma podatków regularnych - Podatek faktycznie zapłacony)
-        # Dla uproszczenia stosujemy proporcję 23% dla pozycji Rabat
         discount_net_grosze = int(round((total_discount_gross / 1.23) * 100))
-        
         services.append({
             'name': 'Rabat',
             'tax_symbol': '23',
@@ -99,10 +92,6 @@ def prepare_services(order):
         })
         
     return services
-
-@app.route('/', methods=['GET'])
-def healthcheck():
-    return 'OK', 200
 
 def create_invoice(order):
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
@@ -143,9 +132,16 @@ def create_invoice(order):
         app.logger.error(f"[VAT ERROR] {r.status_code} {r.text}")
         return None
         
-    uuid = r.json().get('uuid')
+    invoice_data = r.json()
+    uuid = invoice_data.get('uuid')
+
+    # DODANE: Jeśli zamówienie jest opłacone, oznacz fakturę jako zapłaconą
     if uuid and order.get('financial_status') == 'paid':
-        requests.post(f'https://{HOST}/api/v3/async/invoices/{uuid}/paid.json', headers=HEADERS)
+        paid_url = f'https://{HOST}/api/v3/invoices/{uuid}/paid.json'
+        # inFakt wymaga pustego body lub daty zapłaty w POST
+        requests.post(paid_url, headers=HEADERS)
+        app.logger.info(f"Invoice {uuid} marked as PAID")
+        
     return uuid
 
 @app.route('/webhook/orders/create', methods=['POST'])
