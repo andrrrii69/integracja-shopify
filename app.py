@@ -22,12 +22,13 @@ HEADERS = {
 }
 
 def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
+    """Weryfikacja podpisu Shopify"""
     computed = base64.b64encode(
         hmac.new(SHOPIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest()
     )
     return hmac.compare_digest(computed.decode('utf-8'), hmac_header)
 
-# --- NOWE FUNKCJE DLA KOREKT ---
+# --- NOWA SEKCJA: OBSŁUGA KOREKT (ZWROTÓW) ---
 
 def find_invoice_by_order_id(order_id):
     """Szuka faktury w inFakt po external_id (ID zamówienia Shopify)."""
@@ -40,7 +41,9 @@ def find_invoice_by_order_id(order_id):
     return None
 
 def prepare_services_for_correction(refund):
-    """Przygotowuje pozycje do korekty. Kwoty w PLN (float) dla lepszej kompatybilności z API korekt."""
+    """Przygotowuje pozycje do korekty. 
+    WAŻNE: Dla korekt używamy formatu PLN (float), aby uniknąć błędów 500.
+    """
     services = []
     for r_item in refund.get('refund_line_items', []):
         item = r_item['line_item']
@@ -52,7 +55,8 @@ def prepare_services_for_correction(refund):
             rate = float(item['tax_lines'][0].get('rate', 0.23))
         
         tax_symbol = str(int(rate * 100))
-        # Dla korekt używamy formatu PLN (np. 81.30) zamiast groszy
+        # Tutaj używamy PLN (np. 12.34) zamiast groszy, 
+        # bo API korekt inFakt tego wymaga do poprawnej walidacji.
         unit_net_price = round(unit_gross / (1 + rate), 2)
 
         services.append({
@@ -65,7 +69,7 @@ def prepare_services_for_correction(refund):
     return services
 
 def create_correction(refund):
-    """Główna logika wystawiania korekty."""
+    """Tworzy dokument korekty w inFakt."""
     order_id = refund.get('order_id')
     original_invoice = find_invoice_by_order_id(order_id)
     
@@ -87,16 +91,16 @@ def create_correction(refund):
     
     r = requests.post(CORRECTION_ENDPOINT, json=payload, headers=HEADERS)
     if not r.ok:
-        # Logujemy szczegóły, aby uniknąć błędów 500 bez info
+        # Logujemy pełną treść błędu z inFakt, aby wiedzieć co poszło nie tak
         app.logger.error(f"[CORRECTION ERROR] {r.status_code} {r.text}")
         return None
         
     return r.json().get('uuid')
 
-# --- ISTNIEJĄCA LOGIKA TWORZENIA FAKTUR (BEZ ZMIAN) ---
+# --- ORYGINALNA SEKCJA: TWORZENIE FAKTUR (BEZ ZMIAN) ---
 
 def prepare_services(order):
-    """Oryginalna funkcja przygotowania pozycji faktury."""
+    """Twoja oryginalna funkcja przygotowania pozycji (używa groszy)"""
     services = []
     calculated_invoice_total_gross = 0
     
@@ -157,7 +161,7 @@ def prepare_services(order):
     return services
 
 def create_invoice(order):
-    """Oryginalna funkcja wystawiania faktury."""
+    """Twoja oryginalna funkcja wystawiania faktury"""
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
     company = billing.get('company', '')
     nip = "".join(filter(str.isdigit, company)) if company else None
@@ -201,7 +205,7 @@ def create_invoice(order):
         requests.post(f'https://{HOST}/api/v3/async/invoices/{uuid}/paid.json', headers=HEADERS)
     return uuid
 
-# --- ROUTY ---
+# --- ROUTY (ENDPOINTS) ---
 
 @app.route('/', methods=['GET'])
 def healthcheck():
@@ -209,6 +213,7 @@ def healthcheck():
 
 @app.route('/webhook/orders/create', methods=['POST'])
 def orders_create():
+    """Obsługa nowych zamówień"""
     raw, sig = request.get_data(), request.headers.get('X-Shopify-Hmac-Sha256','')
     if not verify_shopify_webhook(raw, sig): abort(401)
     order = request.get_json()
@@ -217,7 +222,7 @@ def orders_create():
 
 @app.route('/webhook/refunds/create', methods=['POST'])
 def refunds_create():
-    """Nowy endpoint do obsługi zwrotów."""
+    """Nowy endpoint dla zwrotów widoczny na screenie"""
     raw, sig = request.get_data(), request.headers.get('X-Shopify-Hmac-Sha256','')
     if not verify_shopify_webhook(raw, sig): abort(401)
     
