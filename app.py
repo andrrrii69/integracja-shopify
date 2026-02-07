@@ -14,40 +14,96 @@ SHOPIFY_WEBHOOK_SECRET = os.getenv('SHOPIFY_WEBHOOK_SECRET', '').encode('utf-8')
 INFAKT_API_KEY = os.getenv('INFAKT_API_KEY')
 HOST = os.getenv('INFAKT_HOST', 'api.infakt.pl')
 VAT_ENDPOINT = f'https://{HOST}/api/v3/invoices.json'
-CORRECTION_ENDPOINT = f'https://{HOST}/api/v3/corrections.json' #
+CORRECTION_ENDPOINT = f'https://{HOST}/api/v3/corrections.json' # Nowy endpoint dla korekt
 HEADERS = {
     'X-inFakt-ApiKey': INFAKT_API_KEY,
     'Content-Type': 'application/json',
     'Accept': 'application/json',
 }
 
-# --- FUNKCJE POMOCNICZE ---
-
 def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
-    """Weryfikacja podpisu HMAC z Shopify"""
     computed = base64.b64encode(
         hmac.new(SHOPIFY_WEBHOOK_SECRET, data, hashlib.sha256).digest()
     )
     return hmac.compare_digest(computed.decode('utf-8'), hmac_header)
 
-def find_invoice_by_order_id(order_id: str):
-    """Szuka faktury w inFakt na podstawie ID zamówienia z Shopify"""
+# --- NOWE FUNKCJE DLA KOREKT ---
+
+def find_invoice_by_order_id(order_id):
+    """Szuka faktury w inFakt po external_id (ID zamówienia Shopify)."""
     params = {'q[external_id_eq]': str(order_id)}
     r = requests.get(VAT_ENDPOINT, headers=HEADERS, params=params)
     if r.ok:
         data = r.json()
-        return data['entities'][0] if data.get('entities') else None
+        if data.get('entities'):
+            return data['entities'][0]
     return None
 
+def prepare_services_for_correction(refund):
+    """Przygotowuje pozycje do korekty. Kwoty w PLN (float) dla lepszej kompatybilności z API korekt."""
+    services = []
+    for r_item in refund.get('refund_line_items', []):
+        item = r_item['line_item']
+        qty = r_item['quantity']
+        unit_gross = float(item['price'])
+        
+        rate = 0.23
+        if item.get('tax_lines'):
+            rate = float(item['tax_lines'][0].get('rate', 0.23))
+        
+        tax_symbol = str(int(rate * 100))
+        # Dla korekt używamy formatu PLN (np. 81.30) zamiast groszy
+        unit_net_price = round(unit_gross / (1 + rate), 2)
+
+        services.append({
+            'name': item['title'],
+            'tax_symbol': tax_symbol,
+            'quantity': qty,
+            'unit_net_price': unit_net_price,
+            'flat_rate_tax_symbol': '3'
+        })
+    return services
+
+def create_correction(refund):
+    """Główna logika wystawiania korekty."""
+    order_id = refund.get('order_id')
+    original_invoice = find_invoice_by_order_id(order_id)
+    
+    if not original_invoice:
+        app.logger.error(f"[CORRECTION ERROR] Nie znaleziono faktury dla zamówienia: {order_id}")
+        return None
+
+    correction_services = prepare_services_for_correction(refund)
+    if not correction_services:
+        return None
+
+    payload = {
+        'correction': {
+            'invoice_id': original_invoice['id'],
+            'reason': 'Zwrot towaru - Shopify Refund',
+            'services': correction_services
+        }
+    }
+    
+    r = requests.post(CORRECTION_ENDPOINT, json=payload, headers=HEADERS)
+    if not r.ok:
+        # Logujemy szczegóły, aby uniknąć błędów 500 bez info
+        app.logger.error(f"[CORRECTION ERROR] {r.status_code} {r.text}")
+        return None
+        
+    return r.json().get('uuid')
+
+# --- ISTNIEJĄCA LOGIKA TWORZENIA FAKTUR (BEZ ZMIAN) ---
+
 def prepare_services(order):
-    """Przygotowanie pozycji dla faktury pierwotnej"""
+    """Oryginalna funkcja przygotowania pozycji faktury."""
     services = []
     calculated_invoice_total_gross = 0
     
     for item in order.get('line_items', []):
         qty = item['quantity']
         unit_gross = float(item['price'])
-        rate = 0.23
+        rate = 0.23 
         if item.get('tax_lines'):
             rate = float(item['tax_lines'][0].get('rate', 0.23))
         
@@ -100,10 +156,8 @@ def prepare_services(order):
         })
     return services
 
-# --- GŁÓWNA LOGIKA ---
-
 def create_invoice(order):
-    """Tworzy fakturę VAT w inFakt"""
+    """Oryginalna funkcja wystawiania faktury."""
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
     company = billing.get('company', '')
     nip = "".join(filter(str.isdigit, company)) if company else None
@@ -147,51 +201,6 @@ def create_invoice(order):
         requests.post(f'https://{HOST}/api/v3/async/invoices/{uuid}/paid.json', headers=HEADERS)
     return uuid
 
-def create_correction(refund):
-    """Wystawia korektę faktury w inFakt na podstawie zwrotu"""
-    order_id = refund.get('order_id')
-    original_invoice = find_invoice_by_order_id(order_id)
-    
-    if not original_invoice:
-        app.logger.error(f"[CORRECTION ERROR] Nie znaleziono faktury dla zamówienia: {order_id}")
-        return None
-
-    # Logika: Przygotowujemy tylko korygowane pozycje (zwroty)
-    correction_services = []
-    for r_item in refund.get('refund_line_items', []):
-        item = r_item['line_item']
-        qty = r_item['quantity']
-        unit_gross = float(item['price'])
-        
-        rate = 0.23
-        if item.get('tax_lines'):
-            rate = float(item['tax_lines'][0].get('rate', 0.23))
-        
-        tax_symbol = str(int(rate * 100))
-        unit_net_grosze = int(round((unit_gross / (1 + rate)) * 100))
-
-        correction_services.append({
-            'name': item['title'],
-            'tax_symbol': tax_symbol,
-            'quantity': qty,
-            'unit_net_price': unit_net_grosze,
-            'flat_rate_tax_symbol': '3'
-        })
-
-    payload = {
-        'correction': {
-            'invoice_id': original_invoice['id'],
-            'reason': 'Zwrot towaru - Shopify Refund',
-            'services': correction_services
-        }
-    }
-    
-    r = requests.post(CORRECTION_ENDPOINT, json=payload, headers=HEADERS)
-    if not r.ok:
-        app.logger.error(f"[CORRECTION ERROR] {r.status_code} {r.text}")
-        return None
-    return r.json().get('uuid')
-
 # --- ROUTY ---
 
 @app.route('/', methods=['GET'])
@@ -208,9 +217,10 @@ def orders_create():
 
 @app.route('/webhook/refunds/create', methods=['POST'])
 def refunds_create():
-    """Endpoint dla zwrotów z Shopify"""
+    """Nowy endpoint do obsługi zwrotów."""
     raw, sig = request.get_data(), request.headers.get('X-Shopify-Hmac-Sha256','')
     if not verify_shopify_webhook(raw, sig): abort(401)
+    
     refund = request.get_json()
     create_correction(refund)
     return '', 200
