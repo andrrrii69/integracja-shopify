@@ -127,6 +127,13 @@ def prepare_services(order):
 def healthcheck():
     return 'OK', 200
 
+app.logger.info({
+  "taxes_included": order.get("taxes_included"),
+  "total_tax": order.get("total_tax"),
+  "order_tax_lines": order.get("tax_lines"),
+  "first_item_tax_lines": (order.get("line_items") or [{}])[0].get("tax_lines"),
+})
+
 
 def create_invoice(order):
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
