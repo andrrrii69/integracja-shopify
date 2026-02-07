@@ -9,6 +9,7 @@ import requests
 
 app = Flask(__name__)
 
+# Konfiguracja z Twojego pliku
 SHOPIFY_WEBHOOK_SECRET = os.getenv('SHOPIFY_WEBHOOK_SECRET', '').encode('utf-8')
 INFAKT_API_KEY = os.getenv('INFAKT_API_KEY')
 HOST = os.getenv('INFAKT_HOST', 'api.infakt.pl')
@@ -28,43 +29,41 @@ def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
 def prepare_services(order):
     services = []
     
-    # 1. Produkty
+    # 1. Produkty - pobieranie netto i doliczanie VAT
     for item in order.get('line_items', []):
         qty = item['quantity']
-        # Cena jednostkowa brutto z Shopify
-        gross_unit_grosze = int(round(float(item['price']) * 100))
         
-        # Podatek sumaryczny dla tej pozycji z tax_lines
-        item_tax_total_grosze = int(round(sum(float(tax.get('price', 0)) for tax in item.get('tax_lines', [])) * 100))
+        # Shopify podaje cenę brutto w 'price'. Obliczamy netto:
+        gross_total_item = float(item['price']) * qty
+        tax_total_item = sum(float(tax.get('price', 0)) for tax in item.get('tax_lines', []))
         
-        total_gross_grosze = gross_unit_grosze * qty
-        total_net_grosze = total_gross_grosze - item_tax_total_grosze
+        # Obliczamy netto w groszach: (Brutto - Podatek)
+        net_total_grosze = int(round((gross_total_item - tax_total_item) * 100))
+        unit_net_grosze = int(round(net_total_grosze / qty))
         
-        # Wyznaczanie symbolu podatku (np. "23")
+        # Wyznaczanie stawki VAT (domyślnie 23%)
         tax_symbol = "23"
         if item.get('tax_lines'):
             rate = float(item['tax_lines'][0].get('rate', 0.23))
             tax_symbol = str(int(rate * 100)) if rate > 0 else "zw"
+        elif not item.get('taxable'):
+            tax_symbol = "zw"
 
         services.append({
             'name': item['title'],
             'tax_symbol': tax_symbol,
             'quantity': qty,
-            'unit_net_price': int(round(total_net_grosze / qty)),
-            'gross_price': total_gross_grosze,
-            'tax_price': item_tax_total_grosze,
+            'unit_net_price': unit_net_grosze,
             'flat_rate_tax_symbol': '3'
         })
 
     # 2. Wysyłka
     for shipping in order.get('shipping_lines', []):
-        amount_gross = float(shipping.get('price', 0))
-        if amount_gross <= 0:
-            continue
+        gross_ship = float(shipping.get('price', 0))
+        if gross_ship <= 0: continue
             
-        gross_grosze = int(round(amount_gross * 100))
-        tax_grosze = int(round(sum(float(tax.get('price', 0)) for tax in shipping.get('tax_lines', [])) * 100))
-        net_grosze = gross_grosze - tax_grosze
+        tax_ship = sum(float(tax.get('price', 0)) for tax in shipping.get('tax_lines', []))
+        net_ship_grosze = int(round((gross_ship - tax_ship) * 100))
         
         ship_tax_symbol = "23"
         if shipping.get('tax_lines'):
@@ -75,27 +74,20 @@ def prepare_services(order):
             'name': f"Wysyłka - {shipping.get('title', 'dostawa')}",
             'tax_symbol': ship_tax_symbol,
             'quantity': 1,
-            'unit_net_price': net_grosze,
-            'gross_price': gross_grosze,
-            'tax_price': tax_grosze,
+            'unit_net_price': net_ship_grosze,
             'flat_rate_tax_symbol': '3'
         })
 
-    # 3. Rabaty
-    discount_value = float(order.get('total_discounts', 0))
-    if discount_value > 0:
-        gross_disc = int(round(discount_value * 100))
-        # Przyjmujemy 23% dla rabatu ogólnego (standardowa praktyka przy braku rozbicia)
-        net_disc = int(round(gross_disc / 1.23))
-        tax_disc = gross_disc - net_disc
-        
+    # 3. Rabaty (jako ujemna pozycja netto)
+    discount_gross = float(order.get('total_discounts', 0))
+    if discount_gross > 0:
+        # Zakładamy rabat od kwoty netto przy stawce 23%
+        net_disc_grosze = int(round((discount_gross / 1.23) * 100))
         services.append({
             'name': 'Rabat',
             'tax_symbol': '23',
             'quantity': 1,
-            'unit_net_price': -net_disc,
-            'gross_price': -gross_disc,
-            'tax_price': -tax_disc,
+            'unit_net_price': -net_disc_grosze,
             'flat_rate_tax_symbol': '3'
         })
         
@@ -107,72 +99,60 @@ def healthcheck():
 
 def create_invoice(order):
     billing = order.get('billing_address') or order.get('customer', {}).get('default_address', {})
-    # Shopify przechowuje NIP często w polach 'company' lub metaforach, tu mapujemy standard
-    nip = billing.get('company') if (billing.get('company') and any(char.isdigit() for char in billing.get('company'))) else None
-    
+    # Próba wyciągnięcia NIP z pola firmy (częsta praktyka w Shopify PL)
+    company_field = billing.get('company', '')
+    nip = "".join(filter(str.isdigit, company_field)) if company_field else None
+    if nip and len(nip) < 9: nip = None # prosta walidacja
+
     activity = 'other_business' if nip else 'private_person'
     client = {
         'client_first_name': billing.get('first_name', ''),
         'client_last_name': billing.get('last_name', ''),
         'client_company_name': billing.get('company', ''),
         'client_street': billing.get('address1', ''),
-        'client_flat_number': billing.get('address2', '') or '',
         'client_city': billing.get('city', ''),
         'client_post_code': billing.get('zip', ''),
         'client_business_activity_kind': activity,
     }
-    if nip:
-        client['client_tax_code'] = nip
+    if nip: client['client_tax_code'] = nip
 
-    # Obsługa formatu daty z Shopify (z uwzględnieniem strefy czasowej)
-    created_str = order['created_at'].split('T')[0]
-    sell = created_str 
-    due = (datetime.strptime(sell, '%Y-%m-%d') + timedelta(days=7)).date().isoformat()
+    sell_date = order['created_at'].split('T')[0]
+    due_date = (datetime.strptime(sell_date, '%Y-%m-%d') + timedelta(days=7)).date().isoformat()
 
     payload = {'invoice': {
         'kind': 'vat',
         'series': os.getenv('INFAKT_SERIES','A'),
         'status': 'issued',
-        'sell_date': sell,
-        'issue_date': sell,
-        'payment_due_date': due,
+        'sell_date': sell_date,
+        'issue_date': sell_date,
+        'payment_due_date': due_date,
         'payment_method': 'transfer',
         'currency': order.get('currency', 'PLN'),
-        'external_id': str(order['id']),
         **client,
         'services': prepare_services(order)
     }}
     
     r = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
     if not r.ok:
-        app.logger.error(f"[VAT ERROR] {r.status_code} {r.text}")
+        app.logger.error(f"[VAT ERROR] {r.text}")
         return None
         
     uuid = r.json().get('uuid')
-    if uuid and order.get('financial_status') in ['paid', 'voided']:
+    if uuid and order.get('financial_status') == 'paid':
         requests.post(f'https://{HOST}/api/v3/async/invoices/{uuid}/paid.json', headers=HEADERS)
     return uuid
 
 def create_correction(order, reason):
     oid = str(order.get('id'))
     r = requests.get(f'https://{HOST}/api/v3/invoices.json?external_id={oid}', headers=HEADERS)
-    if not r.ok:
-        return False
+    if not r.ok: return False
     
     data = r.json()
     invoices = data.get('invoices', []) if isinstance(data, dict) else data
-    
-    if not invoices:
-        return False
+    if not invoices: return False
         
     invoice_uuid = invoices[0].get('uuid')
-    payload = {
-        'correction': {
-            'reason': reason, 
-            'services': prepare_services(order)
-        }
-    }
-    
+    payload = {'correction': {'reason': reason, 'services': prepare_services(order)}}
     c = requests.post(f'https://{HOST}/api/v3/invoices/{invoice_uuid}/correction.json', json=payload, headers=HEADERS)
     return c.ok
 
@@ -180,26 +160,22 @@ def create_correction(order, reason):
 def orders_create():
     raw, sig = request.get_data(), request.headers.get('X-Shopify-Hmac-Sha256','')
     if not verify_shopify_webhook(raw, sig): abort(401)
-    order = request.get_json()
-    if create_invoice(order): 
-        app.logger.info(f"Invoice for order {order['id']} created")
-    return '', 200
+    if create_invoice(request.get_json()): return 'OK', 200
+    return 'Error', 500
 
 @app.route('/webhook/orders/updated', methods=['POST'])
 def orders_updated():
     raw, sig = request.get_data(), request.headers.get('X-Shopify-Hmac-Sha256','')
     if not verify_shopify_webhook(raw, sig): abort(401)
-    order = request.get_json()
-    create_correction(order, 'Edycja zamówienia')
-    return '', 200
+    create_correction(request.get_json(), 'Edycja zamówienia')
+    return 'OK', 200
 
 @app.route('/webhook/orders/cancelled', methods=['POST'])
 def orders_cancelled():
     raw, sig = request.get_data(), request.headers.get('X-Shopify-Hmac-Sha256','')
     if not verify_shopify_webhook(raw, sig): abort(401)
-    order = request.get_json()
-    create_correction(order, 'Anulowanie zamówienia')
-    return '', 200
+    create_correction(request.get_json(), 'Anulowanie zamówienia')
+    return 'OK', 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
