@@ -7,7 +7,7 @@ from flask import Flask, request, abort
 
 app = Flask(__name__)
 
-# Konfiguracja z enviroment variables
+# Konfiguracja
 SHOPIFY_WEBHOOK_SECRET = os.getenv('SHOPIFY_WEBHOOK_SECRET', '').encode('utf-8')
 INFAKT_API_KEY = os.getenv('INFAKT_API_KEY')
 HOST = os.getenv('INFAKT_HOST', 'api.infakt.pl')
@@ -31,24 +31,17 @@ def prepare_services(order):
     services = []
     calculated_total_gross_grosze = 0
     
-    # 1. Produkty
     for item in order.get('line_items', []):
         qty = int(item['quantity'])
-        # Cena brutto za sztukę w walucie (np. 79.99)
         unit_gross_float = float(item['price'])
         
-        # Pobieranie stawki VAT z tax_lines (Shopify: 0.23 -> inFakt: "23")
         rate = 0.23
         if item.get('tax_lines'):
             rate = float(item['tax_lines'][0].get('rate', 0.23))
         
         tax_symbol = str(int(rate * 100))
-        
-        # Obliczanie ceny netto za sztukę w groszach dla inFakt
-        # Wzór: (Brutto / (1 + rate)) * 100
         unit_net_grosze = int(round((unit_gross_float / (1 + rate)) * 100))
         
-        # Suma kontrolna brutto (tak jak policzy to inFakt: Netto_Grosze * Qty * (1+rate))
         line_gross_grosze = int(round(unit_net_grosze * qty * (1 + rate)))
         calculated_total_gross_grosze += line_gross_grosze
 
@@ -56,11 +49,10 @@ def prepare_services(order):
             'name': item['title'],
             'tax_symbol': tax_symbol,
             'quantity': qty,
-            'unit_net_price': unit_net_grosze, # inFakt przyjmuje grosze jako int
-            'flat_rate_tax_symbol': '3' # Domyślna stawka ryczałtu jeśli dotyczy
+            'unit_net_price': unit_net_grosze,
+            'flat_rate_tax_symbol': '3'
         })
 
-    # 2. Wysyłka
     for shipping in order.get('shipping_lines', []):
         ship_gross_float = float(shipping.get('price', 0))
         if ship_gross_float > 0:
@@ -70,7 +62,6 @@ def prepare_services(order):
             
             ship_tax_symbol = str(int(ship_rate * 100))
             ship_net_grosze = int(round((ship_gross_float / (1 + ship_rate)) * 100))
-            
             calculated_total_gross_grosze += int(round(ship_net_grosze * 1 * (1 + ship_rate)))
             
             services.append({
@@ -81,16 +72,12 @@ def prepare_services(order):
                 'flat_rate_tax_symbol': '3'
             })
 
-    # 3. Korekta groszowa (Rabat/Dopłata)
-    # Shopify total_price jest w jednostkach głównych (np. 79.99), zamieniamy na grosze
     target_total_gross_grosze = int(round(float(order.get('total_price', 0)) * 100))
     diff_grosze = calculated_total_gross_grosze - target_total_gross_grosze
 
     if diff_grosze != 0:
-        # Jeśli różnica występuje, dodajemy linię korekcyjną (Rabat)
-        # Używamy stawki 23% lub 0% dla samej korekty
         services.append({
-            'name': 'Korekta zaokrągleń / Rabat',
+            'name': 'Korekta zaokrągleń',
             'tax_symbol': '23',
             'quantity': 1,
             'unit_net_price': int(round(-diff_grosze / 1.23)),
@@ -102,15 +89,15 @@ def prepare_services(order):
 def create_invoice(order):
     billing = order.get('billing_address') or {}
     
-    # Próba wyciągnięcia NIP z pola company
-    company_field = billing.get('company', '')
+    # NAPRAWA BŁĘDU: Dodanie or '' zapewnia, że company_field to zawsze string, a nie None
+    company_field = billing.get('company') or ''
     nip = "".join(filter(str.isdigit, company_field))
     
-    # Walidacja czy to faktycznie NIP (10 cyfr)
     is_business = len(nip) == 10
     activity = 'other_business' if is_business else 'private_person'
     
-    client_name = company_field if company_field else f"{billing.get('first_name', '')} {billing.get('last_name', '')}"
+    # Jeśli company_field jest puste, używamy imienia i nazwiska
+    client_name = company_field if company_field.strip() else f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
 
     payload = {
         'invoice': {
@@ -138,20 +125,15 @@ def create_invoice(order):
     if is_business:
         payload['invoice']['client_tax_code'] = nip
 
-    # Wysłanie faktury
     r = requests.post(VAT_ENDPOINT, json=payload, headers=HEADERS)
-    
     if not r.ok:
-        print(f"[INFAKT ERROR] {r.status_code}: {r.text}")
+        app.logger.error(f"[INFAKT ERROR] {r.status_code}: {r.text}")
         return None
         
-    invoice_data = r.json()
-    invoice_uuid = invoice_data.get('uuid')
+    invoice_uuid = r.json().get('uuid')
     
-    # Jeśli zamówienie opłacone, oznacz fakturę jako opłaconą w inFakt
     if invoice_uuid and order.get('financial_status') == 'paid':
-        paid_url = f'https://{HOST}/api/v3/invoices/{invoice_uuid}/paid.json'
-        requests.post(paid_url, headers=HEADERS)
+        requests.post(f'https://{HOST}/api/v3/invoices/{invoice_uuid}/paid.json', headers=HEADERS)
         
     return invoice_uuid
 
@@ -173,4 +155,4 @@ def health():
     return 'OK', 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 10000)))
