@@ -18,7 +18,7 @@ VAT_ENDPOINT = f'https://{HOST}/api/v3/invoices.json'
 DEFAULT_VAT_RATE = Decimal(os.getenv('DEFAULT_VAT_RATE', '0.23'))
 FLAT_RATE_TAX_SYMBOL = os.getenv('INFAKT_FLAT_RATE_TAX_SYMBOL', '3')
 INFAKT_SERIES = os.getenv('INFAKT_SERIES', 'A')
-INFAKT_PAYMENT_METHOD = os.getenv('INFAKT_PAYMENT_METHOD', 'transfer')
+INFAKT_PAYMENT_METHOD = 'payu'
 INFAKT_SALE_TYPE = os.getenv('INFAKT_SALE_TYPE', '').strip().lower()
 INFAKT_TIMEOUT = int(os.getenv('INFAKT_TIMEOUT', '30'))
 DB_PATH = os.getenv('DB_PATH', '/tmp/shopify_infakt_webhooks.sqlite3')
@@ -617,6 +617,85 @@ def determine_invoice_type(order: Dict[str, Any]) -> str:
     return 'merchandise'
 
 
+def extract_shopify_payment_gateways(order: Dict[str, Any]) -> List[str]:
+    gateways: List[str] = []
+
+    for key in ('payment_gateway_names', 'gateway_names'):
+        value = order.get(key)
+        if isinstance(value, list):
+            gateways.extend(str(item).strip() for item in value if str(item).strip())
+
+    for key in ('gateway', 'source_name', 'processing_method'):
+        value = order.get(key)
+        if value not in (None, ''):
+            gateways.append(str(value).strip())
+
+    for transaction in order.get('transactions', []) or []:
+        for key in ('gateway', 'payment_details'):
+            value = transaction.get(key)
+            if isinstance(value, str) and value.strip():
+                gateways.append(value.strip())
+
+    seen = set()
+    normalized: List[str] = []
+    for gateway in gateways:
+        key = gateway.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(gateway)
+    return normalized
+
+
+def determine_payment_method(order: Dict[str, Any]) -> str:
+    """
+    Sklep korzysta wyłącznie z PayU, więc każdą płatność z Shopify
+    mapujemy w inFakt na metodę `payu`.
+    Dotyczy to także BLIKa, kart i szybkich przelewów realizowanych przez PayU.
+    """
+    return 'payu'
+
+
+def resolve_paid_amount(order: Dict[str, Any]) -> Decimal:
+    financial_status = str(order.get('financial_status') or '').lower()
+    total_price = round_money(D(order.get('current_total_price') or order.get('total_price') or '0'))
+    total_outstanding = round_money(D(order.get('total_outstanding') or '0'))
+
+    if financial_status == 'paid':
+        return total_price
+
+    if financial_status == 'partially_paid':
+        paid_amount = round_money(total_price - total_outstanding)
+        return max(ZERO, paid_amount)
+
+    if financial_status in {'partially_refunded', 'refunded', 'voided', 'pending', 'authorized'}:
+        paid_amount = round_money(total_price - total_outstanding)
+        return max(ZERO, paid_amount)
+
+    return ZERO
+
+
+def resolve_payment_date(order: Dict[str, Any], paid_amount: Decimal) -> Optional[str]:
+    if paid_amount <= ZERO:
+        return None
+
+    for key in ('processed_at', 'created_at', 'updated_at'):
+        raw_value = str(order.get(key) or '')
+        if 'T' in raw_value:
+            return raw_value.split('T')[0]
+        if raw_value:
+            return raw_value[:10]
+
+    return None
+
+
+def build_invoice_notes(order: Dict[str, Any]) -> Optional[str]:
+    gateways = extract_shopify_payment_gateways(order)
+    if not gateways:
+        return None
+    return 'Shopify payment gateway: ' + ', '.join(gateways)
+
+
 def mark_invoice_paid(uuid: str) -> None:
     paid_endpoint = f'https://{HOST}/api/v3/async/invoices/{uuid}/paid.json'
     response = requests.post(paid_endpoint, headers=HEADERS, timeout=INFAKT_TIMEOUT)
@@ -639,6 +718,11 @@ def create_invoice(order: Dict[str, Any]) -> Optional[str]:
         app.logger.warning('Pomijam wystawienie faktury: brak dodatnich pozycji po rabatach dla order_id=%s', order.get('id'))
         return None
 
+    paid_amount = resolve_paid_amount(order)
+    payment_date = resolve_payment_date(order, paid_amount)
+    payment_method = determine_payment_method(order)
+    invoice_notes = build_invoice_notes(order)
+
     payload = {
         'invoice': {
             'kind': 'vat',
@@ -648,13 +732,20 @@ def create_invoice(order: Dict[str, Any]) -> Optional[str]:
             'sell_date': sell_date,
             'issue_date': sell_date,
             'payment_due_date': sell_date,
-            'payment_method': INFAKT_PAYMENT_METHOD,
+            'payment_method': payment_method,
             'currency': order.get('currency', 'PLN'),
             'external_id': str(order.get('id')),
             **build_client(order),
             'services': services,
         }
     }
+
+    if paid_amount > ZERO:
+        payload['invoice']['paid_price'] = to_cents(paid_amount)
+    if payment_date:
+        payload['invoice']['payment_date'] = payment_date
+    if invoice_notes:
+        payload['invoice']['notes'] = invoice_notes
 
     response = requests.post(
         VAT_ENDPOINT,
@@ -668,7 +759,8 @@ def create_invoice(order: Dict[str, Any]) -> Optional[str]:
         return None
 
     uuid = response.json().get('uuid')
-    if uuid and order.get('financial_status') == 'paid':
+    total_price = round_money(D(order.get('current_total_price') or order.get('total_price') or '0'))
+    if uuid and paid_amount >= total_price and total_price > ZERO:
         mark_invoice_paid(uuid)
     return uuid
 
