@@ -2,6 +2,7 @@ import os
 import hmac
 import hashlib
 import base64
+import sqlite3
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,6 +21,7 @@ INFAKT_SERIES = os.getenv('INFAKT_SERIES', 'A')
 INFAKT_PAYMENT_METHOD = os.getenv('INFAKT_PAYMENT_METHOD', 'transfer')
 INFAKT_SALE_TYPE = os.getenv('INFAKT_SALE_TYPE', '').strip().lower()
 INFAKT_TIMEOUT = int(os.getenv('INFAKT_TIMEOUT', '30'))
+DB_PATH = os.getenv('DB_PATH', '/tmp/shopify_infakt_webhooks.sqlite3')
 SHOPIFY_TAX_CODE_KEYS = [
     key.strip().lower()
     for key in os.getenv('SHOPIFY_TAX_CODE_KEYS', 'nip,tax_id,taxid,vat_id,vatid,vat_number')
@@ -42,6 +44,85 @@ DISCOUNT_PRECISION = Decimal('0.01')
 
 class ServiceEntry(Dict[str, Any]):
     pass
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('PRAGMA journal_mode=WAL')
+    return conn
+
+
+def init_db() -> None:
+    conn = get_db()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_events (
+                event_id TEXT PRIMARY KEY,
+                order_id TEXT,
+                invoice_uuid TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_orders (
+                order_id TEXT PRIMARY KEY,
+                invoice_uuid TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def was_event_processed(event_id: str) -> bool:
+    if not event_id:
+        return False
+    conn = get_db()
+    try:
+        row = conn.execute(
+            'SELECT event_id FROM processed_events WHERE event_id = ?',
+            (event_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def was_order_processed(order_id: str) -> bool:
+    if not order_id:
+        return False
+    conn = get_db()
+    try:
+        row = conn.execute(
+            'SELECT order_id FROM processed_orders WHERE order_id = ?',
+            (order_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def mark_processed(event_id: str, order_id: str, invoice_uuid: Optional[str]) -> None:
+    conn = get_db()
+    try:
+        if event_id:
+            conn.execute(
+                'INSERT OR IGNORE INTO processed_events (event_id, order_id, invoice_uuid) VALUES (?, ?, ?)',
+                (event_id, order_id or None, invoice_uuid),
+            )
+        if order_id:
+            conn.execute(
+                'INSERT OR IGNORE INTO processed_orders (order_id, invoice_uuid) VALUES (?, ?)',
+                (order_id, invoice_uuid),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def D(value: Any, default: str = '0') -> Decimal:
@@ -179,7 +260,7 @@ def update_discount_fields(service: Dict[str, Any]) -> None:
     service['discount'] = float(percent_discount(before, after))
 
 
-def build_product_service(line_item: Dict[str, Any], taxes_included: bool) -> ServiceEntry:
+def build_product_service(line_item: Dict[str, Any], taxes_included: bool) -> Optional[ServiceEntry]:
     quantity = int(line_item.get('quantity', 0) or 0)
     if quantity <= 0:
         raise ValueError('Pozycja ma quantity <= 0')
@@ -191,6 +272,10 @@ def build_product_service(line_item: Dict[str, Any], taxes_included: bool) -> Se
     line_gross_before = round_money(unit_price_before * quantity)
     line_discount = resolve_line_discount(line_item)
     line_gross_after = max(ZERO, round_money(line_gross_before - line_discount))
+
+    if line_gross_after <= ZERO:
+        app.logger.info('Pomijam darmową pozycję na fakturze inFakt: %s', line_item.get('title', 'Produkt'))
+        return None
 
     unit_net_before_cents = amount_to_net_cents(unit_price_before, rate, taxes_included)
     unit_gross_after = line_gross_after / quantity
@@ -438,7 +523,9 @@ def prepare_services(order: Dict[str, Any]) -> List[Dict[str, Any]]:
     entries: List[ServiceEntry] = []
 
     for line_item in order.get('line_items', []):
-        entries.append(build_product_service(line_item, taxes_included))
+        result = build_product_service(line_item, taxes_included)
+        if result is not None:
+            entries.append(result)
 
     for shipping_line in order.get('shipping_lines', []):
         result = build_shipping_service(shipping_line, taxes_included)
@@ -547,6 +634,11 @@ def create_invoice(order: Dict[str, Any]) -> Optional[str]:
         return None
 
     sell_date = str(order.get('created_at', '')).split('T')[0]
+    services = prepare_services(order)
+    if not services:
+        app.logger.warning('Pomijam wystawienie faktury: brak dodatnich pozycji po rabatach dla order_id=%s', order.get('id'))
+        return None
+
     payload = {
         'invoice': {
             'kind': 'vat',
@@ -560,7 +652,7 @@ def create_invoice(order: Dict[str, Any]) -> Optional[str]:
             'currency': order.get('currency', 'PLN'),
             'external_id': str(order.get('id')),
             **build_client(order),
-            'services': prepare_services(order),
+            'services': services,
         }
     }
 
@@ -593,10 +685,28 @@ def orders_create() -> Tuple[str, int]:
     if not verify_shopify_webhook(raw, signature):
         abort(401)
 
+    event_id = request.headers.get('X-Shopify-Event-Id', '')
     order = request.get_json(silent=True) or {}
-    create_invoice(order)
+    order_id = str(order.get('id') or '')
+
+    if event_id and was_event_processed(event_id):
+        app.logger.info('Pomijam zduplikowany webhook event_id=%s order_id=%s', event_id, order_id)
+        return '', 200
+
+    if order_id and was_order_processed(order_id):
+        app.logger.info('Pomijam ponowne fakturowanie tego samego order_id=%s', order_id)
+        if event_id:
+            mark_processed(event_id, order_id, None)
+        return '', 200
+
+    invoice_uuid = create_invoice(order)
+    if invoice_uuid:
+        mark_processed(event_id, order_id, invoice_uuid)
+
     return '', 200
 
+
+init_db()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5000')))
