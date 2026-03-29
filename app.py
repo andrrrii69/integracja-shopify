@@ -266,12 +266,17 @@ def candidate_sort_key(entry: ServiceEntry) -> Tuple[int, int, Decimal]:
     )
 
 
-def find_best_unit_net_delta(entry: ServiceEntry, diff: Decimal, max_search_cents: int = 20) -> int:
+def find_best_unit_net_delta(entry: ServiceEntry, diff: Decimal, max_search_cents: Optional[int] = None) -> int:
     service = entry['payload']
     quantity = int(service.get('quantity', 0) or 0)
     current_unit_net = int(service.get('unit_net_price', 0) or 0)
     current_gross = entry['gross_value']
     rate = entry['rate']
+
+    if max_search_cents is None:
+        # Przy większych różnicach (np. rabat koszykowy bez alokacji na line_items)
+        # szukamy szerzej, żeby nie wpadać od razu w sztuczną pozycję wyrównującą.
+        max_search_cents = max(20, int((abs(diff) * HUNDRED).to_integral_value(rounding=ROUND_HALF_UP)) + 10)
 
     best_delta = 0
     best_remaining = abs(diff)
@@ -305,6 +310,9 @@ def apply_unit_net_delta(entry: ServiceEntry, delta: int) -> Decimal:
     current_unit_net = int(service.get('unit_net_price', 0) or 0)
     current_gross = entry['gross_value']
 
+    if delta < 0 and 'unit_net_price_before_discount' not in service:
+        service['unit_net_price_before_discount'] = current_unit_net
+
     new_unit_net = current_unit_net + delta
     service['unit_net_price'] = new_unit_net
     update_discount_fields(service)
@@ -315,10 +323,71 @@ def apply_unit_net_delta(entry: ServiceEntry, delta: int) -> Decimal:
     return gross_delta
 
 
+def estimate_delta_for_target(entry: ServiceEntry, target_gross_change: Decimal) -> int:
+    service = entry['payload']
+    quantity = int(service.get('quantity', 0) or 0)
+    if quantity <= 0:
+        return 0
+
+    rate = entry['rate']
+    unit_step_gross = (ONE + rate) * Decimal(quantity)
+    approx_delta = int(((target_gross_change * HUNDRED) / unit_step_gross).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    search_span = max(20, abs(approx_delta) + 8)
+    return find_best_unit_net_delta(entry, target_gross_change, max_search_cents=search_span)
+
+
+def distribute_order_level_diff(entries: List[ServiceEntry], diff: Decimal) -> Decimal:
+    """
+    Rozrzuca większą ujemną różnicę proporcjonalnie po produktach.
+    To pomaga przy rabatach koszykowych Shopify, które czasem nie trafiają
+    do line_item.discount_allocations w webhooku.
+    """
+    if diff >= ZERO:
+        return diff
+
+    candidates = [
+        entry for entry in sorted(entries, key=candidate_sort_key)
+        if entry.get('can_rebalance') and entry.get('entry_kind') == 'product' and entry['gross_value'] > ZERO
+    ]
+    if not candidates:
+        return diff
+
+    total_gross = round_money(sum((entry['gross_value'] for entry in candidates), ZERO))
+    if total_gross <= ZERO:
+        return diff
+
+    remaining = diff
+
+    for index, entry in enumerate(candidates):
+        if remaining == ZERO:
+            break
+
+        if index == len(candidates) - 1:
+            target_for_entry = remaining
+        else:
+            proportional = round_money(abs(diff) * (entry['gross_value'] / total_gross))
+            target_for_entry = -min(proportional, abs(remaining))
+
+        delta = estimate_delta_for_target(entry, target_for_entry)
+        if delta == 0:
+            continue
+
+        gross_delta = apply_unit_net_delta(entry, delta)
+        if gross_delta == ZERO:
+            continue
+
+        remaining = round_money(remaining - gross_delta)
+
+    return remaining
+
+
 def rebalance_services(entries: List[ServiceEntry], target_gross: Decimal) -> None:
     diff = round_money(target_gross - total_entries_gross(entries))
     if diff == ZERO:
         return
+
+    if abs(diff) >= Decimal('0.05'):
+        diff = distribute_order_level_diff(entries, diff)
 
     candidates = [
         entry for entry in sorted(entries, key=candidate_sort_key)
@@ -376,7 +445,7 @@ def prepare_services(order: Dict[str, Any]) -> List[Dict[str, Any]]:
         if result is not None:
             entries.append(result)
 
-    target_total_gross = round_money(D(order.get('total_price', '0')))
+    target_total_gross = round_money(D(order.get('current_total_price') or order.get('total_price', '0')))
     rebalance_services(entries, target_total_gross)
     return [entry['payload'] for entry in entries]
 
@@ -445,7 +514,7 @@ def build_client(order: Dict[str, Any]) -> Dict[str, Any]:
 
 def determine_invoice_type(order: Dict[str, Any]) -> str:
     """
-    inFakt wymaga pola invoice.type: service | merchandise.
+    inFakt wymaga pola invoice.sale_type: service | merchandise.
     Dla typowego sklepu Shopify z fizycznymi produktami powinno to być
     'merchandise'. Zostawiamy możliwość nadpisania przez env.
     """
@@ -481,7 +550,7 @@ def create_invoice(order: Dict[str, Any]) -> Optional[str]:
     payload = {
         'invoice': {
             'kind': 'vat',
-            'type': determine_invoice_type(order),
+            'sale_type': determine_invoice_type(order),
             'series': INFAKT_SERIES,
             'status': 'issued',
             'sell_date': sell_date,
