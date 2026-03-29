@@ -18,6 +18,7 @@ DEFAULT_VAT_RATE = Decimal(os.getenv('DEFAULT_VAT_RATE', '0.23'))
 FLAT_RATE_TAX_SYMBOL = os.getenv('INFAKT_FLAT_RATE_TAX_SYMBOL', '3')
 INFAKT_SERIES = os.getenv('INFAKT_SERIES', 'A')
 INFAKT_PAYMENT_METHOD = os.getenv('INFAKT_PAYMENT_METHOD', 'transfer')
+INFAKT_SALE_TYPE = os.getenv('INFAKT_SALE_TYPE', '').strip().lower()
 INFAKT_TIMEOUT = int(os.getenv('INFAKT_TIMEOUT', '30'))
 SHOPIFY_TAX_CODE_KEYS = [
     key.strip().lower()
@@ -442,6 +443,24 @@ def build_client(order: Dict[str, Any]) -> Dict[str, Any]:
     return client
 
 
+def determine_invoice_type(order: Dict[str, Any]) -> str:
+    """
+    inFakt wymaga pola invoice.type: service | merchandise.
+    Dla typowego sklepu Shopify z fizycznymi produktami powinno to być
+    'merchandise'. Zostawiamy możliwość nadpisania przez env.
+    """
+    if INFAKT_SALE_TYPE in {'service', 'merchandise'}:
+        return INFAKT_SALE_TYPE
+
+    line_items = order.get('line_items', []) or []
+    if any(item.get('requires_shipping') for item in line_items):
+        return 'merchandise'
+
+    # Gdy Shopify nie poda requires_shipping, dla e-commerce bezpieczniej
+    # założyć sprzedaż towarów niż usług.
+    return 'merchandise'
+
+
 def mark_invoice_paid(uuid: str) -> None:
     paid_endpoint = f'https://{HOST}/api/v3/async/invoices/{uuid}/paid.json'
     response = requests.post(paid_endpoint, headers=HEADERS, timeout=INFAKT_TIMEOUT)
@@ -462,6 +481,7 @@ def create_invoice(order: Dict[str, Any]) -> Optional[str]:
     payload = {
         'invoice': {
             'kind': 'vat',
+            'type': determine_invoice_type(order),
             'series': INFAKT_SERIES,
             'status': 'issued',
             'sell_date': sell_date,
@@ -483,7 +503,7 @@ def create_invoice(order: Dict[str, Any]) -> Optional[str]:
     )
 
     if not response.ok:
-        app.logger.error('[inFakt ERROR] %s %s', response.status_code, response.text)
+        app.logger.error('[inFakt ERROR] %s %s | payload=%s', response.status_code, response.text, payload)
         return None
 
     uuid = response.json().get('uuid')
